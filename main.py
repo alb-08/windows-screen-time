@@ -114,6 +114,13 @@ logging.info(
 catchup_missed_summaries()
 
 
+# ── Startup firewall reconciliation ────────────────────────────────────────────
+# If the previous run was killed without unblocking, state.firewall_blocked may
+# already record rules in netsh. The midnight reset path in tracker unblocks
+# everything at date rollover; for same-day restarts we leave the rules alone
+# since they correctly reflect "limit hit today".
+
+
 # ── UI ─────────────────────────────────────────────────────────────────────────
 
 def _start_ui() -> None:

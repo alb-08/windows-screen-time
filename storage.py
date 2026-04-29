@@ -135,6 +135,8 @@ def _empty_state() -> dict:
         "today": get_today_key(),
         "warned": {},
         "kill_notified": {},
+        "firewall_blocked": {},
+        "exe_paths": {},
         "last_daily_summary": "",
         "last_weekly_summary_monday": "",
     }
@@ -159,7 +161,11 @@ def save_state(state: dict) -> None:
 
 
 def reset_day_flags(state: dict) -> None:
-    """Clear per-day flags and update the 'today' marker. Modifies state in-place."""
+    """Clear per-day flags and update the 'today' marker. Modifies state in-place.
+    Note: caller is responsible for unblocking firewall rules before calling this,
+    since the cleared 'firewall_blocked' map is the source of truth for what's blocked.
+    """
     state["today"] = get_today_key()
     state["warned"] = {}
     state["kill_notified"] = {}
+    state["firewall_blocked"] = {}

@@ -5,16 +5,18 @@ Silently tracks daily playtime for **Rocket League** and **Rainbow Six Siege** o
 ## What it does
 
 - Polls the running process list every 5 seconds and accumulates time when a tracked game is running.
-- **Warns** 5 minutes before the daily limit.
-- **Kills the game** when the limit is reached.
-- **Refuses to start** a game that has less than `min_match_minutes` of time left for the day.
+- **Warns** 15 minutes before the daily limit (configurable).
+- **Blocks the game's internet** at the warning threshold via a Windows Firewall rule, so matchmaking fails for the last few minutes — no more getting yanked mid-queue.
+- **Grace window** (default 5 min): once the limit is reached, your current match has 5 minutes to finish before the game is force-closed.
+- **Kills the game** when limit + grace is exceeded.
+- **Refuses to start** a game that has less than `min_match_minutes` of time left for the day (default 15).
 - **Daily summary** toast at 22:00 showing time played per game (and combined pool, if enabled).
-- **Weekly summary** toast every **Monday at 09:00** covering the previous Mon–Sun (so Sunday-evening play is included).
+- **Weekly summary** toast every **Monday at 09:00** covering the previous Mon–Sun.
 - **Missed-summary catch-up:** if the PC was off / asleep when a summary was due, it fires on next start.
+- **Passcode protection** on loosening actions (raising limits, lowering warnings, resetting usage, quitting the tray).
+- **Tray icon** with live remaining-time tooltip and menu for status / settings / usage editor / restart / quit.
 - **Atomic writes** to `data/playtime.json` and `data/state.json` (no truncation if killed mid-write).
-- **Persistent flags** so warnings/kill notifications fire only once per day even across restarts.
 - All times reset at local midnight; 7 days of history are retained for the weekly summary.
-- **Tray icon** with a tooltip showing live remaining time and a menu for status / settings / usage editor / restart / quit.
 
 ## Requirements
 
@@ -53,6 +55,8 @@ Edit `config.json` (or use the **Settings…** window from the tray menu). Defau
 ```
 
 - **`shared_pool_minutes`**: set to a number (e.g. `120`) to enforce a single combined daily allowance across all tracked games. Per-game `daily_limit_minutes` still applies as a per-game cap.
+- **`grace_minutes`**: extra time after the limit before the game is force-closed (lets the current match finish).
+- **`firewall_block_at_warning`**: when `true`, an outbound block rule is added when the warning fires; rules are removed at midnight or when usage is reset to under the limit. Requires admin (the Task Scheduler entry runs at HIGHEST privilege).
 - **Exe names** must match the process name shown in Task Manager exactly (case-insensitive).
 - **`weekly_summary_time`** is the time on **Monday** at which the previous week's summary is sent.
 
@@ -90,6 +94,28 @@ Remove:
 schtasks /Delete /TN "GameTimeLimiter" /F
 ```
 
+## If toasts don't appear
+
+Modern Windows requires a Start Menu shortcut with a registered AppUserModelID for unpackaged apps to deliver toasts. Run **once** (no admin needed):
+
+```powershell
+python setup_shortcut.py
+```
+
+This creates `Start Menu\Game Time Limiter.lnk` tagged with the AUMID `GameTimeLimiter`. Test:
+
+```powershell
+python -c "from windows_toasts import WindowsToaster, Toast; t=WindowsToaster('GameTimeLimiter'); x=Toast(); x.text_fields=['Test','It works']; t.show_toast(x)"
+```
+
+Also check **Settings → System → Notifications** is on, and **Do not disturb** is off.
+
+## Passcode protection
+
+Set a passcode in **Settings…** to require it before any *loosening* action: raising a daily limit, lowering the warning window, lowering grace minutes (no — that's tightening; raising it does), reducing today's usage, disabling the firewall block, disabling the shared pool, restarting the app, or quitting. Tightening actions never ask for a passcode.
+
+Forgot it? Edit `config.json` directly and remove the `passcode_hash` and `passcode_salt` fields. (This is the intentional escape hatch — anyone with file access can defeat the passcode, so keep your machine locked.)
+
 ## Tray icon
 
 The tray icon ("GT") sits in the Windows notification area and never appears in Alt-Tab. Hover for a live remaining-time tooltip. Right-click for:
@@ -104,15 +130,18 @@ The tray icon ("GT") sits in the Windows notification area and never appears in 
 
 ```
 main.py             Entry point: poll loop + scheduler + UI launcher
-tracker.py          Process monitoring, time accumulation, kill logic, shared-pool math
+tracker.py          Process monitoring, time accumulation, kill, firewall, grace, shared pool
 notifications.py    Windows toast notifications (warnings + summaries)
 storage.py          Atomic JSON persistence (playtime.json + state.json), 7-day rolling history
 config.py           Loads / validates / saves config.json
 config.json         User-editable settings (also editable via UI)
-ui.py               Tray icon + Tk windows (status / settings / usage editor)
+ui.py               Tray icon + Tk windows (status / settings / usage editor) + passcode prompts
+firewall.py         netsh wrappers for outbound block/unblock per exe
+passcode.py         PBKDF2-SHA256 passcode hashing/verification
 setup_startup.py    One-time Task Scheduler registration (run as Admin)
+setup_shortcut.py   One-time Start Menu shortcut registration (for toast AUMID)
 data/playtime.json  Auto-created; per-day totals (gitignored)
-data/state.json     Auto-created; per-day flags + summary timestamps (gitignored)
+data/state.json     Auto-created; per-day flags + summary timestamps + exe paths (gitignored)
 game_limiter.log    Auto-created (gitignored)
 ```
 

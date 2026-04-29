@@ -3,18 +3,22 @@
     "RocketLeague.exe": {
       "display_name": "Rocket League",
       "daily_limit_minutes": 120,
-      "min_match_minutes": 7
+      "min_match_minutes": 15
     },
     "RainbowSix.exe": {
       "display_name": "Rainbow Six Siege",
       "daily_limit_minutes": 120,
-      "min_match_minutes": 10
+      "min_match_minutes": 15
     }
   },
   "shared_pool_minutes": null,
-  "warning_minutes": 5,
+  "warning_minutes": 15,
+  "grace_minutes": 5,
+  "firewall_block_at_warning": true,
   "daily_summary_time": "22:00",
   "weekly_summary_time": "09:00",
   "poll_interval_seconds": 5,
-  "log_file": "game_limiter.log"
+  "log_file": "game_limiter.log",
+  "passcode_hash": null,
+  "passcode_salt": null
 }

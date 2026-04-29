@@ -30,6 +30,10 @@ def load_config() -> dict:
                 print(f"ERROR: Game '{exe}' is missing key '{gk}' in config.json", file=sys.stderr)
                 sys.exit(1)
     cfg.setdefault("shared_pool_minutes", None)
+    cfg.setdefault("grace_minutes", 5)
+    cfg.setdefault("firewall_block_at_warning", True)
+    cfg.setdefault("passcode_hash", None)
+    cfg.setdefault("passcode_salt", None)
     return cfg
 
 

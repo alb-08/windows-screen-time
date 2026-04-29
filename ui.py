@@ -8,16 +8,16 @@ Tk thread via root.after_idle so all Tk widget access stays on one thread.
 """
 import logging
 import os
-import subprocess
 import sys
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from typing import Callable
 
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
 from config import save_config
+from passcode import hash_passcode, passcode_is_set, verify_passcode
 
 REFRESH_MS = 1000
 TRAY_REFRESH_MS = 5000
@@ -30,6 +30,61 @@ def _fmt(total_seconds: int) -> str:
     if h > 0:
         return f"{h}h {m:02d}m"
     return f"{m}m"
+
+
+# ---------------------------------------------------------------------------
+# Passcode gating
+# ---------------------------------------------------------------------------
+
+def _prompt_passcode(parent, config: dict, reason: str) -> bool:
+    """Ask for the passcode; return True if it matches (or none is set)."""
+    if not passcode_is_set(config):
+        return True
+    pc = simpledialog.askstring(
+        "Passcode required",
+        f"Enter passcode to {reason}:",
+        show="*",
+        parent=parent,
+    )
+    if pc is None:
+        return False
+    if verify_passcode(pc, config.get("passcode_salt"), config.get("passcode_hash")):
+        return True
+    messagebox.showerror("Wrong passcode", "Passcode does not match.", parent=parent)
+    return False
+
+
+def _set_passcode_dialog(parent, config: dict) -> None:
+    """Set or change the passcode. Asks for old passcode if one is already set."""
+    if passcode_is_set(config):
+        if not _prompt_passcode(parent, config, "change the passcode"):
+            return
+    new_pc = simpledialog.askstring(
+        "New passcode", "Enter a new passcode (blank to remove):",
+        show="*", parent=parent,
+    )
+    if new_pc is None:
+        return
+    if not new_pc:
+        config.pop("passcode_salt", None)
+        config.pop("passcode_hash", None)
+        save_config(config)
+        messagebox.showinfo("Passcode removed", "Passcode protection is now off.", parent=parent)
+        return
+    confirm = simpledialog.askstring(
+        "Confirm passcode", "Re-enter the new passcode:",
+        show="*", parent=parent,
+    )
+    if confirm is None:
+        return
+    if confirm != new_pc:
+        messagebox.showerror("Mismatch", "Passcodes did not match. Not changed.", parent=parent)
+        return
+    salt, h = hash_passcode(new_pc)
+    config["passcode_salt"] = salt
+    config["passcode_hash"] = h
+    save_config(config)
+    messagebox.showinfo("Passcode set", "Passcode protection is on.", parent=parent)
 
 
 def _make_icon_image() -> Image.Image:
@@ -136,8 +191,10 @@ class SettingsWindow:
         self.entries: dict[str, dict[str, tk.Entry]] = {}
         self.shared_pool_var = tk.StringVar()
         self.warning_var = tk.StringVar()
+        self.grace_var = tk.StringVar()
         self.daily_var = tk.StringVar()
         self.weekly_var = tk.StringVar()
+        self.firewall_var = tk.BooleanVar()
 
         self._build()
 
@@ -178,6 +235,20 @@ class SettingsWindow:
         ttk.Entry(f, width=8, textvariable=self.warning_var).grid(row=row, column=1, padx=8)
         row += 1
 
+        ttk.Label(f, text="Grace after limit (min)").grid(row=row, column=0, sticky="w")
+        self.grace_var.set(str(self.config.get("grace_minutes", 0)))
+        ttk.Entry(f, width=8, textvariable=self.grace_var).grid(row=row, column=1, padx=8)
+        ttk.Label(f, text="lets the current match finish",
+                  foreground="#666").grid(row=row, column=2, columnspan=2, sticky="w", padx=8)
+        row += 1
+
+        self.firewall_var.set(bool(self.config.get("firewall_block_at_warning", True)))
+        ttk.Checkbutton(
+            f, text="Block game's internet during warning window (admin only)",
+            variable=self.firewall_var,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 4))
+        row += 1
+
         ttk.Label(f, text="Daily summary (HH:MM)").grid(row=row, column=0, sticky="w")
         self.daily_var.set(self.config["daily_summary_time"])
         ttk.Entry(f, width=8, textvariable=self.daily_var).grid(row=row, column=1, padx=8)
@@ -188,6 +259,16 @@ class SettingsWindow:
         ttk.Entry(f, width=8, textvariable=self.weekly_var).grid(row=row, column=1, padx=8)
         row += 1
 
+        ttk.Separator(f).grid(row=row, column=0, columnspan=4, sticky="ew", pady=8)
+        row += 1
+        passcode_state = "set" if passcode_is_set(self.config) else "not set"
+        ttk.Label(f, text=f"Passcode: {passcode_state}").grid(row=row, column=0, sticky="w")
+        ttk.Button(
+            f, text="Set / change…",
+            command=lambda: _set_passcode_dialog(self.win, self.config),
+        ).grid(row=row, column=1, padx=8, sticky="w")
+        row += 1
+
         btns = ttk.Frame(f)
         btns.grid(row=row, column=0, columnspan=4, sticky="e", pady=(12, 0))
         ttk.Button(btns, text="Cancel", command=self.win.destroy).pack(side="right", padx=4)
@@ -195,18 +276,33 @@ class SettingsWindow:
 
     def _save(self) -> None:
         try:
+            new_games: dict[str, dict] = {}
+            loosening = False
+
             for exe, fields in self.entries.items():
                 limit = int(fields["limit"].get())
                 match = int(fields["match"].get())
                 if limit <= 0 or match < 0 or match > limit:
                     raise ValueError(f"Invalid limits for {exe}.")
-                self.config["games"][exe]["daily_limit_minutes"] = limit
-                self.config["games"][exe]["min_match_minutes"] = match
+                old_limit = self.config["games"][exe]["daily_limit_minutes"]
+                old_match = self.config["games"][exe]["min_match_minutes"]
+                if limit > old_limit or match < old_match:
+                    loosening = True
+                new_games[exe] = dict(self.config["games"][exe])
+                new_games[exe]["daily_limit_minutes"] = limit
+                new_games[exe]["min_match_minutes"] = match
 
             warning = int(self.warning_var.get())
             if warning < 0:
                 raise ValueError("Warning minutes must be >= 0.")
-            self.config["warning_minutes"] = warning
+            if warning < self.config["warning_minutes"]:
+                loosening = True
+
+            grace = int(self.grace_var.get())
+            if grace < 0:
+                raise ValueError("Grace minutes must be >= 0.")
+            if grace > self.config.get("grace_minutes", 0):
+                loosening = True
 
             for var, key in [(self.daily_var, "daily_summary_time"),
                              (self.weekly_var, "weekly_summary_time")]:
@@ -214,21 +310,42 @@ class SettingsWindow:
                 hh, mm = v.split(":")
                 if not (0 <= int(hh) < 24 and 0 <= int(mm) < 60):
                     raise ValueError(f"Invalid time '{v}'.")
-                self.config[key] = v
 
-            sp = self.shared_pool_var.get().strip()
-            self.config["shared_pool_minutes"] = int(sp) if sp else None
+            sp_raw = self.shared_pool_var.get().strip()
+            new_pool = int(sp_raw) if sp_raw else None
+            old_pool = self.config.get("shared_pool_minutes")
+            if (old_pool is not None and new_pool is None) or \
+               (old_pool is not None and new_pool is not None and new_pool > old_pool):
+                loosening = True
 
-            save_config(self.config)
-            self.tracker.apply_config_update(self.config)
+            new_firewall = bool(self.firewall_var.get())
+            if self.config.get("firewall_block_at_warning", True) and not new_firewall:
+                loosening = True
+
         except Exception as exc:
             messagebox.showerror("Invalid input", str(exc), parent=self.win)
             return
 
+        if loosening and not _prompt_passcode(self.win, self.config,
+                                              "save these settings (loosens limits)"):
+            return
+
+        # All clear - apply.
+        self.config["games"] = new_games
+        self.config["warning_minutes"] = warning
+        self.config["grace_minutes"] = grace
+        self.config["daily_summary_time"] = self.daily_var.get().strip()
+        self.config["weekly_summary_time"] = self.weekly_var.get().strip()
+        self.config["shared_pool_minutes"] = new_pool
+        self.config["firewall_block_at_warning"] = new_firewall
+
+        save_config(self.config)
+        self.tracker.apply_config_update(self.config)
+
         messagebox.showinfo(
             "Settings saved",
             "Most changes apply immediately. Summary times take effect on the "
-            "next launch (restart from the tray menu to apply now).",
+            "next launch (use Restart from the tray menu).",
             parent=self.win,
         )
         self.win.destroy()
@@ -239,14 +356,20 @@ class SettingsWindow:
 # ---------------------------------------------------------------------------
 
 class UsageEditor:
-    def __init__(self, root: tk.Tk, tracker) -> None:
+    def __init__(self, root: tk.Tk, tracker, config: dict) -> None:
         self.tracker = tracker
+        self.config = config
         self.win = tk.Toplevel(root)
         self.win.title("Game Time - Edit Today's Usage")
         self.win.attributes("-topmost", True)
         self.win.protocol("WM_DELETE_WINDOW", self.win.destroy)
 
         self.entries: dict[str, tk.Entry] = {}
+        # Snapshot current usage for "loosening" comparison
+        self._original_seconds: dict[str, int] = {
+            exe: info["played_seconds"]
+            for exe, info in self.tracker.get_status()["games"].items()
+        }
         self._build()
 
     def _build(self) -> None:
@@ -277,24 +400,50 @@ class UsageEditor:
         ttk.Button(btns, text="Apply", command=self._apply).pack(side="right", padx=4)
 
     def _set_one(self, exe: str, minutes: int) -> None:
-        self.tracker.set_today_seconds(exe, minutes * 60)
+        new_seconds = minutes * 60
+        if new_seconds < self._original_seconds.get(exe, 0):
+            if not _prompt_passcode(self.win, self.config,
+                                    f"reduce {exe} usage (gives back time)"):
+                return
+        self.tracker.set_today_seconds(exe, new_seconds)
+        self._original_seconds[exe] = new_seconds
         self.entries[exe].delete(0, tk.END)
         self.entries[exe].insert(0, str(minutes))
 
     def _reset_all(self) -> None:
+        # Single passcode prompt for the whole batch.
+        if any(0 < self._original_seconds.get(exe, 0) for exe in self.entries):
+            if not _prompt_passcode(self.win, self.config,
+                                    "reset usage (gives back time)"):
+                return
         for exe in list(self.entries.keys()):
-            self._set_one(exe, 0)
+            self.tracker.set_today_seconds(exe, 0)
+            self._original_seconds[exe] = 0
+            self.entries[exe].delete(0, tk.END)
+            self.entries[exe].insert(0, "0")
 
     def _apply(self) -> None:
         try:
+            updates: list[tuple[str, int]] = []
+            loosening = False
             for exe, e in self.entries.items():
                 m = int(e.get())
                 if m < 0:
                     raise ValueError("Minutes must be >= 0.")
-                self.tracker.set_today_seconds(exe, m * 60)
+                new_seconds = m * 60
+                if new_seconds < self._original_seconds.get(exe, 0):
+                    loosening = True
+                updates.append((exe, new_seconds))
         except Exception as exc:
             messagebox.showerror("Invalid input", str(exc), parent=self.win)
             return
+        if loosening and not _prompt_passcode(
+            self.win, self.config, "reduce today's usage (gives back time)"
+        ):
+            return
+        for exe, secs in updates:
+            self.tracker.set_today_seconds(exe, secs)
+            self._original_seconds[exe] = secs
         self.win.destroy()
 
 
@@ -330,7 +479,7 @@ def run_ui(tracker, config: dict) -> None:
         _open("settings", lambda: SettingsWindow(root, tracker, config))
 
     def show_usage_editor() -> None:
-        _open("usage", lambda: UsageEditor(root, tracker))
+        _open("usage", lambda: UsageEditor(root, tracker, config))
 
     def open_log() -> None:
         log_path = config.get("log_file", "game_limiter.log")
@@ -340,11 +489,19 @@ def run_ui(tracker, config: dict) -> None:
             logging.warning("Could not open log file: %s", exc)
 
     def restart_app() -> None:
+        if not _prompt_passcode(root, config, "restart Game Time Limiter"):
+            return
         logging.info("Restart requested from tray menu.")
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def quit_app() -> None:
+        if not _prompt_passcode(root, config, "quit Game Time Limiter"):
+            return
         logging.info("Quit requested from tray menu.")
+        try:
+            tracker.shutdown_unblock_all()
+        except Exception:
+            logging.exception("Unblock-all on shutdown failed.")
         try:
             icon.stop()
         except Exception:

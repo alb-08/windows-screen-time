@@ -22,6 +22,7 @@ from notifications import (
     notify_shared_pool_killed,
     notify_warning,
 )
+from firewall import block_outbound, unblock_outbound, unblock_all
 
 
 class GameTracker:
@@ -38,6 +39,8 @@ class GameTracker:
         self.warning_minutes: int = config["warning_minutes"]
         self.poll_interval: int = config["poll_interval_seconds"]
         self.shared_pool_minutes: int | None = config.get("shared_pool_minutes") or None
+        self.grace_minutes: int = int(config.get("grace_minutes", 0) or 0)
+        self.firewall_block_at_warning: bool = bool(config.get("firewall_block_at_warning", True))
 
         self.data: dict = load_data()
         self.state: dict = load_state()
@@ -60,6 +63,9 @@ class GameTracker:
         today = get_today_key()
         if self.state.get("today") != today:
             logging.info("Date changed to %s - resetting per-day flags", today)
+            # Unblock any firewall rules from yesterday before clearing the map.
+            previously_blocked = list(self.state.get("firewall_blocked", {}).keys())
+            unblock_all(previously_blocked)
             reset_day_flags(self.state)
             save_state(self.state)
             # Refresh data from disk in case another process touched it.
@@ -96,6 +102,37 @@ class GameTracker:
             except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
                 logging.warning("Could not kill %s: %s", exe_name, exc)
         return killed_any
+
+    def _capture_exe_path(self, exe_name: str) -> str | None:
+        """Record the full path to the exe in state.exe_paths (needed for firewall rules)."""
+        cached = self.state.get("exe_paths", {}).get(exe_name)
+        if cached:
+            return cached
+        for proc in self._iter_processes(exe_name):
+            try:
+                path = proc.exe()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            if path:
+                self.state.setdefault("exe_paths", {})[exe_name] = path
+                save_state(self.state)
+                return path
+        return None
+
+    def _apply_firewall_block(self, exe_name: str) -> bool:
+        """Apply firewall block if not already blocked. Returns True if a new block was applied."""
+        blocked_map = self.state.setdefault("firewall_blocked", {})
+        if blocked_map.get(exe_name):
+            return False
+        path = self._capture_exe_path(exe_name)
+        if not path:
+            logging.warning("Cannot block %s: exe path unknown.", exe_name)
+            return False
+        if block_outbound(exe_name, path):
+            blocked_map[exe_name] = True
+            save_state(self.state)
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Limit math
@@ -183,7 +220,11 @@ class GameTracker:
 
                     if remaining <= 0:
                         logging.info("%s launched but time exhausted.", exe)
+                        # Cache path before killing so we can still block the firewall.
+                        self._capture_exe_path(exe)
                         killed = self._kill_game(exe)
+                        if self._apply_firewall_block(exe):
+                            any_state_change = True
                         if killed and not kill_notified.get(exe):
                             if pool_remaining is not None and pool_remaining <= 0:
                                 if notify_shared_pool_killed(cfg["display_name"]):
@@ -216,6 +257,8 @@ class GameTracker:
                     continue
 
                 # ── Continuing session ─────────────────────────────────
+                self._capture_exe_path(exe)  # opportunistic: cache path while running
+
                 if self._last_poll_dt is not None:
                     added = self._accumulate_delta(self._last_poll_dt, now_dt, exe)
                     if added > 0:
@@ -223,13 +266,20 @@ class GameTracker:
 
                 remaining = self._effective_remaining(exe)
                 pool_remaining = self._shared_pool_remaining()
+                grace_s = self.grace_minutes * 60
 
                 if remaining <= 0:
-                    save_data(self.data)
-                    self.game_running[exe] = False
-                    killed = self._kill_game(exe)
-                    if killed and not kill_notified.get(exe):
-                        if pool_remaining is not None and pool_remaining <= 0:
+                    # Limit hit. First time? Notify and (if grace=0) kill now.
+                    if not kill_notified.get(exe):
+                        if self.grace_minutes > 0:
+                            if notify_warning(
+                                cfg["display_name"] + " (limit reached)",
+                                self.grace_minutes,
+                            ):
+                                kill_notified[exe] = True
+                                any_state_change = True
+                                logging.info("%s grace started (%dm).", exe, self.grace_minutes)
+                        elif pool_remaining is not None and pool_remaining <= 0:
                             if notify_shared_pool_killed(cfg["display_name"]):
                                 kill_notified[exe] = True
                                 any_state_change = True
@@ -237,8 +287,19 @@ class GameTracker:
                             if notify_killed_time_up(cfg["display_name"]):
                                 kill_notified[exe] = True
                                 any_state_change = True
-                    logging.info("%s killed: limit reached.", exe)
-                    any_data_change = False  # already saved above
+
+                    # Always block the firewall once the limit is hit.
+                    if self._apply_firewall_block(exe):
+                        any_state_change = True
+
+                    over_by = -remaining
+                    if over_by >= grace_s:
+                        # Past grace - kill now.
+                        save_data(self.data)
+                        self.game_running[exe] = False
+                        self._kill_game(exe)
+                        logging.info("%s killed: limit + grace exceeded.", exe)
+                        any_data_change = False  # already saved above
 
                 elif remaining <= warning_s and not warned.get(exe):
                     mins_left = max(1, remaining // 60)
@@ -246,6 +307,9 @@ class GameTracker:
                         warned[exe] = True
                         any_state_change = True
                         logging.info("Warning sent for %s: %dm remaining.", exe, mins_left)
+                    if self.firewall_block_at_warning:
+                        if self._apply_firewall_block(exe):
+                            any_state_change = True
 
             else:
                 if self.game_running[exe]:
@@ -315,6 +379,7 @@ class GameTracker:
                 "shared_pool_used_seconds": combined,
                 "games": {},
             }
+            firewall_blocked = self.state.get("firewall_blocked", {})
             for exe, cfg in self.games.items():
                 limit_s = cfg["daily_limit_minutes"] * 60
                 played = day.get(exe, 0)
@@ -330,7 +395,9 @@ class GameTracker:
                     "running": self.game_running.get(exe, False),
                     "warned": bool(warned.get(exe)),
                     "killed": bool(kill_notified.get(exe)),
+                    "firewall_blocked": bool(firewall_blocked.get(exe)),
                 }
+            status["grace_minutes"] = self.grace_minutes
             return status
 
     # ------------------------------------------------------------------
@@ -344,6 +411,8 @@ class GameTracker:
             self.warning_minutes = new_config["warning_minutes"]
             self.poll_interval = new_config["poll_interval_seconds"]
             self.shared_pool_minutes = new_config.get("shared_pool_minutes") or None
+            self.grace_minutes = int(new_config.get("grace_minutes", 0) or 0)
+            self.firewall_block_at_warning = bool(new_config.get("firewall_block_at_warning", True))
             for exe in self.games:
                 self.game_running.setdefault(exe, False)
             logging.info("Config hot-reloaded.")
@@ -353,10 +422,22 @@ class GameTracker:
         with self._lock:
             from storage import set_game_seconds_today
             set_game_seconds_today(self.data, exe, seconds)
-            # Reset the per-day flags for this exe so warnings/kills can fire again
-            # if the user reset usage to zero.
+            # Clear per-day flags for this exe so warnings/kills can fire again.
             self.state["warned"].pop(exe, None)
             self.state["kill_notified"].pop(exe, None)
+            # Unblock the firewall if reducing usage gives them time again.
+            limit_s = self.games[exe]["daily_limit_minutes"] * 60
+            if seconds < limit_s and self.state.get("firewall_blocked", {}).get(exe):
+                unblock_outbound(exe)
+                self.state["firewall_blocked"].pop(exe, None)
             save_data(self.data)
             save_state(self.state)
             logging.info("Usage override: %s set to %ds.", exe, seconds)
+
+    def shutdown_unblock_all(self) -> None:
+        """Remove every firewall rule we've installed. Called on quit."""
+        with self._lock:
+            blocked = list(self.state.get("firewall_blocked", {}).keys())
+            unblock_all(blocked)
+            self.state["firewall_blocked"] = {}
+            save_state(self.state)
