@@ -1,0 +1,19 @@
+{
+  "games": {
+    "RocketLeague.exe": {
+      "display_name": "Rocket League",
+      "daily_limit_minutes": 120,
+      "min_match_minutes": 7
+    },
+    "RainbowSix.exe": {
+      "display_name": "Rainbow Six Siege",
+      "daily_limit_minutes": 120,
+      "min_match_minutes": 10
+    }
+  },
+  "warning_minutes": 5,
+  "daily_summary_time": "22:00",
+  "weekly_summary_time": "20:00",
+  "poll_interval_seconds": 5,
+  "log_file": "game_limiter.log"
+}
