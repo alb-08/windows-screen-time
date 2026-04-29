@@ -14,50 +14,23 @@ def _get_toaster() -> WindowsToaster:
     return _toaster
 
 
-def _send_toast(lines: list[str]) -> None:
+def _send_toast(lines: list[str]) -> bool:
     """
     Fire a Windows toast notification.
     lines[0] = title (bold)
     lines[1:] = body text lines
-    Failures are logged but never raise exceptions into the caller.
+    Returns True on success, False on failure (failures are also logged).
     """
     if not lines:
-        return
+        return False
     try:
         toast = Toast()
         toast.text_fields = lines
         _get_toaster().show_toast(toast)
+        return True
     except Exception as exc:
         logging.error("Toast notification failed: %s", exc)
-
-
-def notify_warning(display_name: str, minutes_left: int) -> None:
-    """Fires when warning_minutes remain for a running game."""
-    _send_toast([
-        "⚠️ Game Time Warning",
-        f"{display_name}: {minutes_left} minute{'s' if minutes_left != 1 else ''} remaining today.",
-        "Finish up - your session will end automatically.",
-    ])
-
-
-def notify_killed_time_up(display_name: str) -> None:
-    """Fires when a game is killed because the daily limit was reached."""
-    _send_toast([
-        "\U0001f6d1 Daily Limit Reached",
-        f"{display_name} has been closed.",
-        "You've used your full 2-hour daily allowance.",
-    ])
-
-
-def notify_killed_no_match_time(
-    display_name: str, min_match_minutes: int, minutes_left: int
-) -> None:
-    """Fires when a game is killed on launch because there isn't time for a full match."""
-    _send_toast([
-        "\U0001f6d1 Not Enough Time to Play",
-        f"{display_name} has been closed.",
-        f"Only {minutes_left}m remaining today - minimum session is {min_match_minutes}m.",
-    ])
+        return False
 
 
 def _fmt(total_seconds: int) -> str:
@@ -70,45 +43,89 @@ def _fmt(total_seconds: int) -> str:
     return f"{m}m"
 
 
-def notify_daily_summary(games_config: dict, data: dict, day_key: str) -> None:
-    """Send a single multi-line toast summarising today's playtime for all tracked games."""
-    day_data = data.get(day_key, {})
-    lines = ["\U0001f4ca Daily Game Summary"]
+def notify_warning(display_name: str, minutes_left: int) -> bool:
+    return _send_toast([
+        "Game Time Warning",
+        f"{display_name}: {minutes_left} minute{'s' if minutes_left != 1 else ''} remaining today.",
+        "Finish up - your session will end automatically.",
+    ])
 
+
+def notify_killed_time_up(display_name: str) -> bool:
+    return _send_toast([
+        "Daily Limit Reached",
+        f"{display_name} has been closed.",
+        "You've used your full daily allowance.",
+    ])
+
+
+def notify_killed_no_match_time(display_name: str, min_match_minutes: int, minutes_left: int) -> bool:
+    return _send_toast([
+        "Not Enough Time to Play",
+        f"{display_name} has been closed.",
+        f"Only {minutes_left}m left today (minimum session is {min_match_minutes}m).",
+    ])
+
+
+def notify_shared_pool_killed(display_name: str) -> bool:
+    return _send_toast([
+        "Daily Limit Reached",
+        f"{display_name} closed - combined daily pool used up.",
+        "All tracked games are blocked until tomorrow.",
+    ])
+
+
+def notify_daily_summary(games_config: dict, data: dict, day_key: str,
+                         shared_pool_minutes: int | None = None) -> bool:
+    """
+    Single multi-line toast summarising a day's playtime.
+    Stays within 3 body lines (or 4 with shared pool) to fit the toast template.
+    """
+    day_data = data.get(day_key, {})
+    lines = ["Daily Game Summary"]
+
+    combined_s = 0
     for exe, cfg in games_config.items():
         played_s = day_data.get(exe, 0)
+        combined_s += played_s
         limit_s = cfg["daily_limit_minutes"] * 60
-        played_fmt = _fmt(played_s)
-        limit_fmt = _fmt(limit_s)
-        line = f"{cfg['display_name']}: {played_fmt} / {limit_fmt}"
+        line = f"{cfg['display_name']}: {_fmt(played_s)} / {_fmt(limit_s)}"
         if played_s >= limit_s:
-            line += "  ✅ Limit hit"
+            line += "  (limit hit)"
         lines.append(line)
 
-    _send_toast(lines)
+    if shared_pool_minutes:
+        pool_s = shared_pool_minutes * 60
+        line = f"Combined: {_fmt(combined_s)} / {_fmt(pool_s)}"
+        if combined_s >= pool_s:
+            line += "  (pool used)"
+        lines.append(line)
+
+    return _send_toast(lines)
 
 
-def notify_weekly_summary(games_config: dict, week_data: dict) -> None:
-    """Send a single multi-line toast summarising the Mon-Sun week for all tracked games."""
+def notify_weekly_summary(games_config: dict, week_data: dict) -> bool:
+    """
+    Single multi-line toast for a Mon-Sun week.
+    One body line per game (3 lines total for two games) to fit the toast template.
+    """
     dates = sorted(week_data.keys())
     if dates:
         start = date.fromisoformat(dates[0])
         end = date.fromisoformat(dates[-1])
-        range_label = f"  ({start.strftime('%a %#d %b')} – {end.strftime('%a %#d %b')})"
+        range_label = f"  ({start.strftime('%a %#d %b')} - {end.strftime('%a %#d %b')})"
     else:
         range_label = ""
 
-    lines = [f"\U0001f4c5 Weekly Game Summary{range_label}"]
+    lines = [f"Weekly Game Summary{range_label}"]
 
     for exe, cfg in games_config.items():
         limit_s = cfg["daily_limit_minutes"] * 60
         total_s = sum(day.get(exe, 0) for day in week_data.values())
         avg_s = total_s // 7
         days_hit = sum(1 for day in week_data.values() if day.get(exe, 0) >= limit_s)
-
         lines.append(
-            f"{cfg['display_name']}: {_fmt(total_s)} total, {_fmt(avg_s)} avg/day"
+            f"{cfg['display_name']}: {_fmt(total_s)}, {_fmt(avg_s)} avg/day, {days_hit}/7 days hit"
         )
-        lines.append(f"  Limit hit: {days_hit}/7 days")
 
-    _send_toast(lines)
+    return _send_toast(lines)

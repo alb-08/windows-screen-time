@@ -21,7 +21,16 @@ def main() -> None:
 
     main_script = script_dir / "main.py"
     task_name = "GameTimeLimiter"
-    username = os.environ.get("USERNAME", "")
+
+    # Prefer `whoami` output (DOMAIN\user or AzureAD\user) over bare USERNAME,
+    # which doesn't work for domain-joined or Microsoft-account machines.
+    try:
+        username = subprocess.check_output(["whoami"], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        username = os.environ.get("USERNAME", "")
+    if not username:
+        print("ERROR: could not determine current user (whoami / %USERNAME% both empty).")
+        sys.exit(1)
 
     cmd = [
         "schtasks", "/Create",

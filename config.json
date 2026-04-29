@@ -11,9 +11,10 @@
       "min_match_minutes": 10
     }
   },
+  "shared_pool_minutes": null,
   "warning_minutes": 5,
   "daily_summary_time": "22:00",
-  "weekly_summary_time": "20:00",
+  "weekly_summary_time": "09:00",
   "poll_interval_seconds": 5,
   "log_file": "game_limiter.log"
 }

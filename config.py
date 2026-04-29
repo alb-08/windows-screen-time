@@ -29,4 +29,11 @@ def load_config() -> dict:
             if gk not in game_cfg:
                 print(f"ERROR: Game '{exe}' is missing key '{gk}' in config.json", file=sys.stderr)
                 sys.exit(1)
+    cfg.setdefault("shared_pool_minutes", None)
     return cfg
+
+
+def save_config(cfg: dict) -> None:
+    """Persist the config dict back to config.json (used by the settings UI)."""
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
