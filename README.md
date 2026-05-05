@@ -1,0 +1,166 @@
+# Game Time Limiter
+
+Silently tracks daily playtime for **Rocket League** and **Rainbow Six Siege** on Windows 10/11, enforces per-game (or combined) daily limits, sends toast notifications, and exposes a tray icon with live usage and a settings UI.
+
+## What it does
+
+- Polls the running process list every 5 seconds and accumulates time when a tracked game is running.
+- **Warns** 15 minutes before the daily limit (configurable).
+- **Blocks the game's internet** at the warning threshold via a Windows Firewall rule, so matchmaking fails for the last few minutes — no more getting yanked mid-queue.
+- **Grace window** (default 5 min): once the limit is reached, your current match has 5 minutes to finish before the game is force-closed.
+- **Kills the game** when limit + grace is exceeded.
+- **Refuses to start** a game that has less than `min_match_minutes` of time left for the day (default 15).
+- **Daily summary** toast at 22:00 showing time played per game (and combined pool, if enabled).
+- **Weekly summary** toast every **Monday at 09:00** covering the previous Mon–Sun.
+- **Missed-summary catch-up:** if the PC was off / asleep when a summary was due, it fires on next start.
+- **Passcode protection** on loosening actions (raising limits, lowering warnings, resetting usage, quitting the tray).
+- **Tray icon** with live remaining-time tooltip and menu for status / settings / usage editor / restart / quit.
+- **Atomic writes** to `data/playtime.json` and `data/state.json` (no truncation if killed mid-write).
+- All times reset at local midnight; 7 days of history are retained for the weekly summary.
+
+## Requirements
+
+- Windows 10 (build 18362+) or Windows 11
+- Python 3.11 or newer
+- Administrator access (only required once, for the Task Scheduler setup)
+
+## Install
+
+```powershell
+git clone https://github.com/alb-08/windows-screen-time.git
+cd windows-screen-time
+
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+## Configure
+
+Edit `config.json` (or use the **Settings…** window from the tray menu). Defaults:
+
+```json
+{
+  "applications": {
+    "RocketLeague.exe":  { "display_name": "Rocket League",     "daily_limit_minutes": 120, "min_match_minutes": 7  },
+    "RainbowSix.exe":    { "display_name": "Rainbow Six Siege", "daily_limit_minutes": 120, "min_match_minutes": 10 }
+  },
+  "shared_pool_minutes": null,
+  "warning_minutes": 5,
+  "daily_summary_time": "22:00",
+  "weekly_summary_time": "09:00",
+  "poll_interval_seconds": 5,
+  "log_file": "game_limiter.log"
+}
+```
+
+- **`shared_pool_minutes`**: set to a number (e.g. `120`) to enforce a single combined daily allowance shared across all tracked applications. While pool mode is on the per-app `daily_limit_minutes` is ignored; switching back to per-app mode restores it.
+- **`grace_minutes`**: extra time after the limit before the game is force-closed (lets the current match finish).
+- **`firewall_block_at_warning`**: when `true`, an outbound block rule is added when the warning fires; rules are removed at midnight or when usage is reset to under the limit. Requires admin (the Task Scheduler entry runs at HIGHEST privilege).
+- **Exe names** must match the process name shown in Task Manager exactly (case-insensitive).
+- **`weekly_summary_time`** is the time on **Monday** at which the previous week's summary is sent.
+
+## Run manually (foreground, for testing)
+
+```powershell
+python main.py
+```
+
+A log file (`game_limiter.log`) is created in the project directory. `Ctrl+C` to stop. The tray icon will appear in the notification area.
+
+## Install as a startup task (recommended)
+
+Run **once** from an Administrator PowerShell or CMD:
+
+```powershell
+python setup_startup.py
+```
+
+This registers a Task Scheduler entry `GameTimeLimiter` that:
+- Triggers `ONLOGON` (when you sign in)
+- Runs as your user (uses `whoami` output, so domain / Microsoft accounts work) with `HIGHEST` privilege
+- Uses `pythonw.exe` (no console window)
+
+Verify / start without rebooting:
+
+```powershell
+schtasks /Query /TN "GameTimeLimiter" /FO LIST
+schtasks /Run   /TN "GameTimeLimiter"
+```
+
+Remove:
+
+```powershell
+schtasks /Delete /TN "GameTimeLimiter" /F
+```
+
+## If toasts don't appear
+
+Modern Windows requires a Start Menu shortcut with a registered AppUserModelID for unpackaged apps to deliver toasts. Run **once** (no admin needed):
+
+```powershell
+python setup_shortcut.py
+```
+
+This creates `Start Menu\Game Time Limiter.lnk` tagged with the AUMID `GameTimeLimiter`. Test:
+
+```powershell
+python -c "from windows_toasts import WindowsToaster, Toast; t=WindowsToaster('GameTimeLimiter'); x=Toast(); x.text_fields=['Test','It works']; t.show_toast(x)"
+```
+
+Also check **Settings → System → Notifications** is on, and **Do not disturb** is off.
+
+## Passcode protection
+
+Set a passcode in **Settings…** to require it before any *loosening* action: raising a daily limit, lowering the warning window, lowering grace minutes (no — that's tightening; raising it does), reducing today's usage, disabling the firewall block, disabling the shared pool, restarting the app, or quitting. Tightening actions never ask for a passcode.
+
+Forgot it? Edit `config.json` directly and remove the `passcode_hash` and `passcode_salt` fields. (This is the intentional escape hatch — anyone with file access can defeat the passcode, so keep your machine locked.)
+
+## Tray icon
+
+The tray icon ("GT") sits in the Windows notification area and never appears in Alt-Tab. Hover for a live remaining-time tooltip. Right-click for:
+
+- **Show today's usage** (default left-click) — progress bars per application and combined pool.
+- **Edit today's usage…** — override or reset today's totals (also clears the warned/killed flags so warnings/kills can fire again if you reset to zero).
+- **Manage applications…** — add, edit, and remove tracked applications. Add from running processes (filterable list) or by exe name; live "today" column refreshes every second. Removing an application requires the passcode.
+- **Settings…** — switch between per-application limits and combined pool mode, change warning/grace minutes, summary times, firewall toggle, and passcode. Saved to `config.json`. Most fields apply immediately; summary times take effect on the next launch (use **Restart**).
+- **Open log** — opens `game_limiter.log` in your default text editor.
+- **Restart** / **Quit**.
+
+## File layout
+
+```
+main.py             Entry point: poll loop + scheduler + UI launcher
+tracker.py          Process monitoring, time accumulation, kill, firewall, grace, shared pool
+notifications.py    Windows toast notifications (warnings + summaries)
+storage.py          Atomic JSON persistence (playtime.json + state.json), 7-day rolling history
+config.py           Loads / validates / saves config.json
+config.json         User-editable settings (also editable via UI)
+ui.py               Tray icon + Tk windows (status / settings / usage editor) + passcode prompts
+firewall.py         netsh wrappers for outbound block/unblock per exe
+passcode.py         PBKDF2-SHA256 passcode hashing/verification
+setup_startup.py    One-time Task Scheduler registration (run as Admin)
+setup_shortcut.py   One-time Start Menu shortcut registration (for toast AUMID)
+data/playtime.json  Auto-created; per-day totals (gitignored)
+data/state.json     Auto-created; per-day flags + summary timestamps + exe paths (gitignored)
+game_limiter.log    Auto-created (gitignored)
+```
+
+## Tail the log
+
+```powershell
+Get-Content .\game_limiter.log -Wait -Tail 50
+```
+
+## Known limitations
+
+- **Sleep inflation:** if the PC sleeps mid-session, up to ~10 seconds of phantom playtime can be recorded per sleep/wake cycle (capped by design).
+- **Sub-poll sessions:** a game opened and closed entirely between two 5-second polls is not counted (inherent to polling).
+- **Single-instance only:** running `main.py` twice will double-count playtime. The Task Scheduler entry handles this; don't also run it manually.
+- **Per-user data:** `data/playtime.json` is local to the project folder. For multi-user households, give each user their own copy.
+- **Launcher idle time:** if a game's exe stays running while idle in a launcher, that idle time still counts.
+
+## Uninstall
+
+1. `schtasks /Delete /TN "GameTimeLimiter" /F`
+2. Delete the project folder.

@@ -1,0 +1,47 @@
+import json
+import sys
+from pathlib import Path
+
+BASE_DIR = Path(__file__).parent.resolve()
+CONFIG_FILE = BASE_DIR / "config.json"
+
+
+def load_config() -> dict:
+    """Load and return the configuration. Exits with an error if config is missing or invalid."""
+    if not CONFIG_FILE.exists():
+        print(f"ERROR: config.json not found at {CONFIG_FILE}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: config.json is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Backwards compat: older configs used "games" instead of "applications".
+    if "applications" not in cfg and "games" in cfg:
+        cfg["applications"] = cfg.pop("games")
+
+    required_keys = ["applications", "warning_minutes", "daily_summary_time",
+                     "weekly_summary_time", "poll_interval_seconds"]
+    for key in required_keys:
+        if key not in cfg:
+            print(f"ERROR: config.json is missing required key: '{key}'", file=sys.stderr)
+            sys.exit(1)
+    for exe, app_cfg in cfg["applications"].items():
+        for gk in ["display_name", "daily_limit_minutes", "min_match_minutes"]:
+            if gk not in app_cfg:
+                print(f"ERROR: Application '{exe}' is missing key '{gk}' in config.json", file=sys.stderr)
+                sys.exit(1)
+    cfg.setdefault("shared_pool_minutes", None)
+    cfg.setdefault("grace_minutes", 5)
+    cfg.setdefault("firewall_block_at_warning", True)
+    cfg.setdefault("passcode_hash", None)
+    cfg.setdefault("passcode_salt", None)
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    """Persist the config dict back to config.json (used by the settings UI)."""
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
