@@ -75,17 +75,17 @@ def notify_shared_pool_killed(display_name: str) -> bool:
     ])
 
 
-def notify_daily_summary(games_config: dict, data: dict, day_key: str,
+def notify_daily_summary(apps_config: dict, data: dict, day_key: str,
                          shared_pool_minutes: int | None = None) -> bool:
     """
     Single multi-line toast summarising a day's playtime.
     Stays within 3 body lines (or 4 with shared pool) to fit the toast template.
     """
     day_data = data.get(day_key, {})
-    lines = ["Daily Game Summary"]
+    lines = ["Daily Summary"]
 
     combined_s = 0
-    for exe, cfg in games_config.items():
+    for exe, cfg in apps_config.items():
         played_s = day_data.get(exe, 0)
         combined_s += played_s
         limit_s = cfg["daily_limit_minutes"] * 60
@@ -104,10 +104,10 @@ def notify_daily_summary(games_config: dict, data: dict, day_key: str,
     return _send_toast(lines)
 
 
-def notify_weekly_summary(games_config: dict, week_data: dict) -> bool:
+def notify_weekly_summary(apps_config: dict, week_data: dict) -> bool:
     """
     Single multi-line toast for a Mon-Sun week.
-    One body line per game (3 lines total for two games) to fit the toast template.
+    One body line per app (3 lines total for two apps) to fit the toast template.
     """
     dates = sorted(week_data.keys())
     if dates:
@@ -117,9 +117,9 @@ def notify_weekly_summary(games_config: dict, week_data: dict) -> bool:
     else:
         range_label = ""
 
-    lines = [f"Weekly Game Summary{range_label}"]
+    lines = [f"Weekly Summary{range_label}"]
 
-    for exe, cfg in games_config.items():
+    for exe, cfg in apps_config.items():
         limit_s = cfg["daily_limit_minutes"] * 60
         total_s = sum(day.get(exe, 0) for day in week_data.values())
         avg_s = total_s // 7

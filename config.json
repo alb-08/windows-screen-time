@@ -1,5 +1,5 @@
 {
-  "games": {
+  "applications": {
     "RocketLeague.exe": {
       "display_name": "Rocket League",
       "daily_limit_minutes": 120,

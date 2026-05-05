@@ -38,7 +38,7 @@ tracker = GameTracker(config)
 def _send_daily_summary_for(day_key: str) -> None:
     data = tracker.get_live_snapshot()
     pool = config.get("shared_pool_minutes") or None
-    if notify_daily_summary(config["games"], data, day_key, shared_pool_minutes=pool):
+    if notify_daily_summary(config["applications"], data, day_key, shared_pool_minutes=pool):
         with tracker._lock:
             tracker.state["last_daily_summary"] = day_key
             save_state(tracker.state)
@@ -48,7 +48,7 @@ def _send_daily_summary_for(day_key: str) -> None:
 def _send_weekly_summary_for(monday: date) -> None:
     data = tracker.get_live_snapshot()
     week_data = get_week_data(data, monday=monday)
-    if notify_weekly_summary(config["games"], week_data):
+    if notify_weekly_summary(config["applications"], week_data):
         with tracker._lock:
             tracker.state["last_weekly_summary_monday"] = monday.isoformat()
             save_state(tracker.state)

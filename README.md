@@ -41,7 +41,7 @@ Edit `config.json` (or use the **Settings…** window from the tray menu). Defau
 
 ```json
 {
-  "games": {
+  "applications": {
     "RocketLeague.exe":  { "display_name": "Rocket League",     "daily_limit_minutes": 120, "min_match_minutes": 7  },
     "RainbowSix.exe":    { "display_name": "Rainbow Six Siege", "daily_limit_minutes": 120, "min_match_minutes": 10 }
   },
@@ -54,7 +54,7 @@ Edit `config.json` (or use the **Settings…** window from the tray menu). Defau
 }
 ```
 
-- **`shared_pool_minutes`**: set to a number (e.g. `120`) to enforce a single combined daily allowance across all tracked games. Per-game `daily_limit_minutes` still applies as a per-game cap.
+- **`shared_pool_minutes`**: set to a number (e.g. `120`) to enforce a single combined daily allowance shared across all tracked applications. While pool mode is on the per-app `daily_limit_minutes` is ignored; switching back to per-app mode restores it.
 - **`grace_minutes`**: extra time after the limit before the game is force-closed (lets the current match finish).
 - **`firewall_block_at_warning`**: when `true`, an outbound block rule is added when the warning fires; rules are removed at midnight or when usage is reset to under the limit. Requires admin (the Task Scheduler entry runs at HIGHEST privilege).
 - **Exe names** must match the process name shown in Task Manager exactly (case-insensitive).
@@ -120,9 +120,10 @@ Forgot it? Edit `config.json` directly and remove the `passcode_hash` and `passc
 
 The tray icon ("GT") sits in the Windows notification area and never appears in Alt-Tab. Hover for a live remaining-time tooltip. Right-click for:
 
-- **Show today's usage** (default left-click) — progress bars per game and combined pool.
+- **Show today's usage** (default left-click) — progress bars per application and combined pool.
 - **Edit today's usage…** — override or reset today's totals (also clears the warned/killed flags so warnings/kills can fire again if you reset to zero).
-- **Settings…** — change limits, warning time, summary times, and toggle the shared pool. Saved to `config.json`. Most fields apply immediately; summary times take effect on the next launch (use **Restart**).
+- **Manage applications…** — add, edit, and remove tracked applications. Add from running processes (filterable list) or by exe name; live "today" column refreshes every second. Removing an application requires the passcode.
+- **Settings…** — switch between per-application limits and combined pool mode, change warning/grace minutes, summary times, firewall toggle, and passcode. Saved to `config.json`. Most fields apply immediately; summary times take effect on the next launch (use **Restart**).
 - **Open log** — opens `game_limiter.log` in your default text editor.
 - **Restart** / **Quit**.
 

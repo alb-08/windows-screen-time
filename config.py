@@ -18,16 +18,20 @@ def load_config() -> dict:
         print(f"ERROR: config.json is not valid JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
-    required_keys = ["games", "warning_minutes", "daily_summary_time",
+    # Backwards compat: older configs used "games" instead of "applications".
+    if "applications" not in cfg and "games" in cfg:
+        cfg["applications"] = cfg.pop("games")
+
+    required_keys = ["applications", "warning_minutes", "daily_summary_time",
                      "weekly_summary_time", "poll_interval_seconds"]
     for key in required_keys:
         if key not in cfg:
             print(f"ERROR: config.json is missing required key: '{key}'", file=sys.stderr)
             sys.exit(1)
-    for exe, game_cfg in cfg["games"].items():
+    for exe, app_cfg in cfg["applications"].items():
         for gk in ["display_name", "daily_limit_minutes", "min_match_minutes"]:
-            if gk not in game_cfg:
-                print(f"ERROR: Game '{exe}' is missing key '{gk}' in config.json", file=sys.stderr)
+            if gk not in app_cfg:
+                print(f"ERROR: Application '{exe}' is missing key '{gk}' in config.json", file=sys.stderr)
                 sys.exit(1)
     cfg.setdefault("shared_pool_minutes", None)
     cfg.setdefault("grace_minutes", 5)

@@ -35,7 +35,7 @@ class GameTracker:
     """
 
     def __init__(self, config: dict) -> None:
-        self.games: dict = config["games"]
+        self.applications: dict = config["applications"]
         self.warning_minutes: int = config["warning_minutes"]
         self.poll_interval: int = config["poll_interval_seconds"]
         self.shared_pool_minutes: int | None = config.get("shared_pool_minutes") or None
@@ -46,8 +46,8 @@ class GameTracker:
         self.state: dict = load_state()
         self._lock = threading.RLock()
 
-        # In-memory only: which games are currently running and have a live session.
-        self.game_running: dict[str, bool] = {exe: False for exe in self.games}
+        # In-memory only: which applications are currently running and have a live session.
+        self.app_running: dict[str, bool] = {exe: False for exe in self.applications}
 
         # Wall-clock time of previous poll (for midnight-split delta).
         self._last_poll_dt: datetime | None = None
@@ -140,7 +140,7 @@ class GameTracker:
 
     def _combined_today(self) -> int:
         day = self.data.get(get_today_key(), {})
-        return sum(day.get(exe, 0) for exe in self.games)
+        return sum(day.get(exe, 0) for exe in self.applications)
 
     def _shared_pool_remaining(self) -> int | None:
         if not self.shared_pool_minutes:
@@ -148,11 +148,15 @@ class GameTracker:
         return self.shared_pool_minutes * 60 - self._combined_today()
 
     def _effective_remaining(self, exe: str) -> int:
-        """Remaining seconds for this game today, taking shared pool (if any) into account."""
-        cfg = self.games[exe]
-        per_game = cfg["daily_limit_minutes"] * 60 - get_game_seconds_today(self.data, exe)
+        """Remaining seconds for this app today.
+        In pool mode the per-app daily_limit_minutes is ignored entirely; only the
+        shared pool gates playtime. In per-app mode the per-app limit applies.
+        """
         pool = self._shared_pool_remaining()
-        return per_game if pool is None else min(per_game, pool)
+        if pool is not None:
+            return pool
+        cfg = self.applications[exe]
+        return cfg["daily_limit_minutes"] * 60 - get_game_seconds_today(self.data, exe)
 
     # ------------------------------------------------------------------
     # Delta accumulation across midnight
@@ -208,12 +212,12 @@ class GameTracker:
         warned = self.state["warned"]
         kill_notified = self.state["kill_notified"]
 
-        for exe, cfg in self.games.items():
+        for exe, cfg in self.applications.items():
             running = self._process_running(exe)
             min_match_s = cfg["min_match_minutes"] * 60
 
             if running:
-                if not self.game_running[exe]:
+                if not self.app_running[exe]:
                     # ── New session starting ────────────────────────────
                     remaining = self._effective_remaining(exe)
                     pool_remaining = self._shared_pool_remaining()
@@ -248,7 +252,7 @@ class GameTracker:
                                 any_state_change = True
                         continue
 
-                    self.game_running[exe] = True
+                    self.app_running[exe] = True
                     logging.info(
                         "%s session started. %dm remaining today.",
                         exe, remaining // 60,
@@ -296,7 +300,7 @@ class GameTracker:
                     if over_by >= grace_s:
                         # Past grace - kill now.
                         save_data(self.data)
-                        self.game_running[exe] = False
+                        self.app_running[exe] = False
                         self._kill_game(exe)
                         logging.info("%s killed: limit + grace exceeded.", exe)
                         any_data_change = False  # already saved above
@@ -312,8 +316,8 @@ class GameTracker:
                             any_state_change = True
 
             else:
-                if self.game_running[exe]:
-                    self.game_running[exe] = False
+                if self.app_running[exe]:
+                    self.app_running[exe] = False
                     logging.info(
                         "%s session ended. Total today: %ds.",
                         exe, get_game_seconds_today(self.data, exe),
@@ -353,15 +357,17 @@ class GameTracker:
               "today": "YYYY-MM-DD",
               "shared_pool_minutes": int | None,
               "shared_pool_used_seconds": int,
-              "games": {
+              "applications": {
                  exe: {
                     "display_name": str,
-                    "limit_seconds": int,
+                    "limit_seconds": int,        # display limit (pool total in pool mode)
+                    "per_app_limit_seconds": int,
                     "played_seconds": int,
-                    "remaining_seconds": int,  # effective (incl. shared pool)
+                    "remaining_seconds": int,    # effective (incl. shared pool)
                     "running": bool,
                     "warned": bool,
                     "killed": bool,
+                    "firewall_blocked": bool,
                  }, ...
               }
             }
@@ -372,27 +378,33 @@ class GameTracker:
             day = self.data.get(today_key, {})
             warned = self.state.get("warned", {})
             kill_notified = self.state.get("kill_notified", {})
-            combined = sum(day.get(exe, 0) for exe in self.games)
+            combined = sum(day.get(exe, 0) for exe in self.applications)
             status = {
                 "today": today_key,
                 "shared_pool_minutes": self.shared_pool_minutes,
                 "shared_pool_used_seconds": combined,
-                "games": {},
+                "applications": {},
             }
             firewall_blocked = self.state.get("firewall_blocked", {})
-            for exe, cfg in self.games.items():
+            pool_remaining = self._shared_pool_remaining()
+            for exe, cfg in self.applications.items():
                 limit_s = cfg["daily_limit_minutes"] * 60
                 played = day.get(exe, 0)
-                per_game_remaining = limit_s - played
-                pool_remaining = self._shared_pool_remaining()
-                effective = (per_game_remaining if pool_remaining is None
-                             else min(per_game_remaining, pool_remaining))
-                status["games"][exe] = {
+                # In pool mode, the displayed limit becomes the pool total so progress
+                # bars / remaining text reflect the actual gate.
+                if pool_remaining is not None:
+                    display_limit_s = self.shared_pool_minutes * 60
+                    effective = pool_remaining
+                else:
+                    display_limit_s = limit_s
+                    effective = limit_s - played
+                status["applications"][exe] = {
                     "display_name": cfg["display_name"],
-                    "limit_seconds": limit_s,
+                    "limit_seconds": display_limit_s,
+                    "per_app_limit_seconds": limit_s,
                     "played_seconds": played,
                     "remaining_seconds": max(0, effective),
-                    "running": self.game_running.get(exe, False),
+                    "running": self.app_running.get(exe, False),
                     "warned": bool(warned.get(exe)),
                     "killed": bool(kill_notified.get(exe)),
                     "firewall_blocked": bool(firewall_blocked.get(exe)),
@@ -407,14 +419,17 @@ class GameTracker:
     def apply_config_update(self, new_config: dict) -> None:
         """Hot-apply a new config dict (edited via the settings window)."""
         with self._lock:
-            self.games = new_config["games"]
+            self.applications = new_config["applications"]
             self.warning_minutes = new_config["warning_minutes"]
             self.poll_interval = new_config["poll_interval_seconds"]
             self.shared_pool_minutes = new_config.get("shared_pool_minutes") or None
             self.grace_minutes = int(new_config.get("grace_minutes", 0) or 0)
             self.firewall_block_at_warning = bool(new_config.get("firewall_block_at_warning", True))
-            for exe in self.games:
-                self.game_running.setdefault(exe, False)
+            for exe in list(self.app_running.keys()):
+                if exe not in self.applications:
+                    self.app_running.pop(exe, None)
+            for exe in self.applications:
+                self.app_running.setdefault(exe, False)
             logging.info("Config hot-reloaded.")
 
     def set_today_seconds(self, exe: str, seconds: int) -> None:
@@ -426,7 +441,7 @@ class GameTracker:
             self.state["warned"].pop(exe, None)
             self.state["kill_notified"].pop(exe, None)
             # Unblock the firewall if reducing usage gives them time again.
-            limit_s = self.games[exe]["daily_limit_minutes"] * 60
+            limit_s = self.applications[exe]["daily_limit_minutes"] * 60
             if seconds < limit_s and self.state.get("firewall_blocked", {}).get(exe):
                 unblock_outbound(exe)
                 self.state["firewall_blocked"].pop(exe, None)

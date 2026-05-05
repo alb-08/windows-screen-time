@@ -13,6 +13,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 from typing import Callable
 
+import psutil
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
@@ -105,6 +106,29 @@ def _make_icon_image() -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
+# Process listing (for "Add from running")
+# ---------------------------------------------------------------------------
+
+def _list_running_processes() -> list[dict]:
+    """Return [{name, exe, pid}] for running processes, deduped by name."""
+    seen: dict[str, dict] = {}
+    for proc in psutil.process_iter(["name", "exe", "pid"]):
+        try:
+            info = proc.info
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        name = info.get("name") or ""
+        if not name or name.lower() in seen:
+            continue
+        seen[name.lower()] = {
+            "name": name,
+            "exe": info.get("exe") or "",
+            "pid": info.get("pid"),
+        }
+    return sorted(seen.values(), key=lambda p: p["name"].lower())
+
+
+# ---------------------------------------------------------------------------
 # Status window
 # ---------------------------------------------------------------------------
 
@@ -113,44 +137,60 @@ class StatusWindow:
         self.tracker = tracker
         self.win = tk.Toplevel(root)
         self.win.title("Game Time - Today")
-        self.win.geometry("420x260")
+        self.win.geometry("440x300")
         self.win.attributes("-topmost", True)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
         self.rows: dict[str, dict] = {}
+        self._built_for: set[str] = set()
         self._build()
         self._refresh()
 
     def _build(self) -> None:
-        outer = ttk.Frame(self.win, padding=12)
-        outer.pack(fill="both", expand=True)
+        self.outer = ttk.Frame(self.win, padding=12)
+        self.outer.pack(fill="both", expand=True)
 
-        ttk.Label(outer, text="Today's playtime", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Separator(outer).pack(fill="x", pady=(4, 8))
+        ttk.Label(self.outer, text="Today's playtime",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Separator(self.outer).pack(fill="x", pady=(4, 8))
 
-        status = self.tracker.get_status()
-        for exe, info in status["games"].items():
-            row = ttk.Frame(outer)
-            row.pack(fill="x", pady=4)
-            name = ttk.Label(row, text=info["display_name"], width=22, anchor="w")
-            name.pack(side="left")
-            bar = ttk.Progressbar(row, length=180, maximum=info["limit_seconds"])
-            bar.pack(side="left", padx=6)
-            label = ttk.Label(row, text="", width=18, anchor="w")
-            label.pack(side="left")
-            self.rows[exe] = {"bar": bar, "label": label}
+        self.rows_frame = ttk.Frame(self.outer)
+        self.rows_frame.pack(fill="both", expand=True)
 
-        self.pool_label = ttk.Label(outer, text="", anchor="w")
+        self.pool_label = ttk.Label(self.outer, text="", anchor="w")
         self.pool_label.pack(fill="x", pady=(8, 0))
+
+    def _ensure_row(self, exe: str, display_name: str) -> None:
+        if exe in self._built_for:
+            return
+        row = ttk.Frame(self.rows_frame)
+        row.pack(fill="x", pady=4)
+        name = ttk.Label(row, text=display_name, width=22, anchor="w")
+        name.pack(side="left")
+        bar = ttk.Progressbar(row, length=180, maximum=1)
+        bar.pack(side="left", padx=6)
+        label = ttk.Label(row, text="", width=18, anchor="w")
+        label.pack(side="left")
+        self.rows[exe] = {"row": row, "name": name, "bar": bar, "label": label}
+        self._built_for.add(exe)
 
     def _refresh(self) -> None:
         if not self.win.winfo_exists():
             return
         status = self.tracker.get_status()
-        for exe, info in status["games"].items():
-            r = self.rows.get(exe)
-            if not r:
-                continue
+        live_exes = set(status["applications"].keys())
+
+        # Drop UI rows for apps that were removed.
+        for exe in list(self.rows.keys()):
+            if exe not in live_exes:
+                self.rows[exe]["row"].destroy()
+                self.rows.pop(exe, None)
+                self._built_for.discard(exe)
+
+        for exe, info in status["applications"].items():
+            self._ensure_row(exe, info["display_name"])
+            r = self.rows[exe]
+            r["name"].configure(text=info["display_name"])
             r["bar"]["maximum"] = max(1, info["limit_seconds"])
             r["bar"]["value"] = min(info["played_seconds"], info["limit_seconds"])
             tag = "  [running]" if info["running"] else ""
@@ -176,7 +216,345 @@ class StatusWindow:
 
 
 # ---------------------------------------------------------------------------
-# Settings window
+# Add / Edit application form
+# ---------------------------------------------------------------------------
+
+class AppFormDialog:
+    """Modal dialog used by Manage Applications: add (manual or from running)
+    and edit. Calls on_ok({display_name, exe, daily_limit_minutes,
+    min_match_minutes}) when the user confirms."""
+
+    def __init__(self, parent, title: str, *,
+                 from_running: bool = False,
+                 initial: dict | None = None,
+                 on_ok: Callable[[dict], None] | None = None) -> None:
+        self.on_ok = on_ok
+        self.from_running = from_running
+        self.win = tk.Toplevel(parent)
+        self.win.title(title)
+        self.win.transient(parent)
+        self.win.grab_set()
+        self.win.attributes("-topmost", True)
+        self.win.geometry("560x" + ("460" if from_running else "260"))
+
+        outer = ttk.Frame(self.win, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        if from_running:
+            ttk.Label(outer, text="Pick a running process:").pack(anchor="w")
+            top = ttk.Frame(outer)
+            top.pack(fill="x", pady=(2, 6))
+            ttk.Label(top, text="Filter:").pack(side="left")
+            self.filter_var = tk.StringVar()
+            self.filter_var.trace_add("write", lambda *_: self._refilter())
+            ttk.Entry(top, textvariable=self.filter_var).pack(
+                side="left", fill="x", expand=True, padx=6)
+            ttk.Button(top, text="Refresh", command=self._reload_processes).pack(side="left")
+
+            list_frame = ttk.Frame(outer)
+            list_frame.pack(fill="both", expand=True)
+            self.proc_tree = ttk.Treeview(
+                list_frame, columns=("name", "path"), show="headings", height=8
+            )
+            self.proc_tree.heading("name", text="Process")
+            self.proc_tree.heading("path", text="Path")
+            self.proc_tree.column("name", width=160, anchor="w")
+            self.proc_tree.column("path", width=340, anchor="w")
+            sb = ttk.Scrollbar(list_frame, orient="vertical", command=self.proc_tree.yview)
+            self.proc_tree.configure(yscrollcommand=sb.set)
+            self.proc_tree.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+            self.proc_tree.bind("<<TreeviewSelect>>", self._on_proc_select)
+            self._all_procs: list[dict] = []
+            self._reload_processes()
+            ttk.Separator(outer).pack(fill="x", pady=8)
+
+        form = ttk.Frame(outer)
+        form.pack(fill="x")
+        initial = initial or {}
+
+        ttk.Label(form, text="Display name:").grid(row=0, column=0, sticky="w", pady=2)
+        self.display_var = tk.StringVar(value=initial.get("display_name", ""))
+        ttk.Entry(form, textvariable=self.display_var, width=32).grid(
+            row=0, column=1, padx=6, pady=2, sticky="w")
+
+        ttk.Label(form, text="Exe name:").grid(row=1, column=0, sticky="w", pady=2)
+        self.exe_var = tk.StringVar(value=initial.get("exe", ""))
+        self.exe_entry = ttk.Entry(form, textvariable=self.exe_var, width=32)
+        self.exe_entry.grid(row=1, column=1, padx=6, pady=2, sticky="w")
+        if initial:
+            self.exe_entry.configure(state="readonly")
+
+        ttk.Label(form, text="Daily limit (min):").grid(row=2, column=0, sticky="w", pady=2)
+        self.limit_var = tk.StringVar(value=str(initial.get("daily_limit_minutes", 60)))
+        ttk.Entry(form, textvariable=self.limit_var, width=10).grid(
+            row=2, column=1, padx=6, pady=2, sticky="w")
+
+        ttk.Label(form, text="Min match (min):").grid(row=3, column=0, sticky="w", pady=2)
+        self.match_var = tk.StringVar(value=str(initial.get("min_match_minutes", 0)))
+        ttk.Entry(form, textvariable=self.match_var, width=10).grid(
+            row=3, column=1, padx=6, pady=2, sticky="w")
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=self.win.destroy).pack(side="right", padx=4)
+        ttk.Button(btns, text="OK", command=self._submit).pack(side="right", padx=4)
+
+    def _reload_processes(self) -> None:
+        try:
+            self._all_procs = _list_running_processes()
+        except Exception:
+            logging.exception("Failed to list running processes.")
+            self._all_procs = []
+        self._refilter()
+
+    def _refilter(self) -> None:
+        flt = self.filter_var.get().lower() if hasattr(self, "filter_var") else ""
+        self.proc_tree.delete(*self.proc_tree.get_children())
+        for p in self._all_procs:
+            if flt and flt not in p["name"].lower():
+                continue
+            self.proc_tree.insert("", "end", iid=p["name"], values=(p["name"], p["exe"]))
+
+    def _on_proc_select(self, _evt) -> None:
+        sel = self.proc_tree.selection()
+        if not sel:
+            return
+        name = sel[0]
+        proc = next((p for p in self._all_procs if p["name"] == name), None)
+        if not proc:
+            return
+        # Default display name: strip .exe and title-case.
+        suggested = proc["name"].rsplit(".", 1)[0]
+        if not self.display_var.get().strip():
+            self.display_var.set(suggested)
+        self.exe_var.set(proc["name"])
+
+    def _submit(self) -> None:
+        try:
+            limit = int(self.limit_var.get())
+            match = int(self.match_var.get())
+            if limit <= 0:
+                raise ValueError("Daily limit must be > 0.")
+            if match < 0:
+                raise ValueError("Min match must be >= 0.")
+            if match > limit:
+                raise ValueError("Min match cannot exceed daily limit.")
+            display = self.display_var.get().strip()
+            exe = self.exe_var.get().strip()
+            if not display:
+                raise ValueError("Display name is required.")
+            if not exe:
+                raise ValueError("Exe name is required.")
+        except ValueError as exc:
+            messagebox.showerror("Invalid input", str(exc), parent=self.win)
+            return
+        if self.on_ok:
+            self.on_ok({
+                "display_name": display,
+                "exe": exe,
+                "daily_limit_minutes": limit,
+                "min_match_minutes": match,
+            })
+        self.win.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Manage Applications window
+# ---------------------------------------------------------------------------
+
+class ManageApplicationsWindow:
+    def __init__(self, root: tk.Tk, tracker, config: dict) -> None:
+        self.tracker = tracker
+        self.config = config
+        self.win = tk.Toplevel(root)
+        self.win.title("Game Time - Manage Applications")
+        self.win.geometry("720x460")
+        self.win.minsize(580, 320)
+        self.win.attributes("-topmost", True)
+        self.win.protocol("WM_DELETE_WINDOW", self.win.destroy)
+        self._build()
+        self._refresh_tree()
+        self._tick()
+
+    def _build(self) -> None:
+        outer = ttk.Frame(self.win, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(outer, text="Tracked applications",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Separator(outer).pack(fill="x", pady=(4, 8))
+
+        tree_frame = ttk.Frame(outer)
+        tree_frame.pack(fill="both", expand=True)
+
+        cols = ("display_name", "exe", "limit", "match", "today")
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=10)
+        self.tree.heading("display_name", text="Display name")
+        self.tree.heading("exe", text="Exe")
+        self.tree.heading("limit", text="Limit (min)")
+        self.tree.heading("match", text="Min match (min)")
+        self.tree.heading("today", text="Today")
+        self.tree.column("display_name", width=200, anchor="w")
+        self.tree.column("exe", width=200, anchor="w")
+        self.tree.column("limit", width=90, anchor="center")
+        self.tree.column("match", width=120, anchor="center")
+        self.tree.column("today", width=80, anchor="center")
+
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-1>", lambda _e: self._edit())
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill="x", pady=(8, 0))
+        ttk.Button(btns, text="Add from running…",
+                   command=self._add_running).pack(side="left", padx=(0, 4))
+        ttk.Button(btns, text="Add manually…",
+                   command=self._add_manual).pack(side="left", padx=4)
+        self.edit_btn = ttk.Button(btns, text="Edit…", command=self._edit, state="disabled")
+        self.remove_btn = ttk.Button(btns, text="Remove…", command=self._remove, state="disabled")
+        self.edit_btn.pack(side="left", padx=4)
+        self.remove_btn.pack(side="left", padx=4)
+
+        ttk.Label(outer, text="* = currently running",
+                  foreground="#666").pack(anchor="w", pady=(8, 0))
+
+        close_row = ttk.Frame(outer)
+        close_row.pack(fill="x", pady=(8, 0))
+        ttk.Button(close_row, text="Close", command=self.win.destroy).pack(side="right")
+
+    def _refresh_tree(self) -> None:
+        if not self.win.winfo_exists():
+            return
+        # Preserve selection across rebuilds.
+        prev_sel = self.tree.selection()[0] if self.tree.selection() else None
+
+        self.tree.delete(*self.tree.get_children())
+        status = self.tracker.get_status()
+        apps = status["applications"]
+        if not apps:
+            self.tree.insert("", "end", values=("(no applications tracked yet)", "", "", "", ""))
+            self.edit_btn.configure(state="disabled")
+            self.remove_btn.configure(state="disabled")
+            return
+        for exe, info in apps.items():
+            cfg = self.config["applications"][exe]
+            display = info["display_name"] + (" *" if info["running"] else "")
+            today_min = info["played_seconds"] // 60
+            self.tree.insert("", "end", iid=exe, values=(
+                display, exe,
+                f"{cfg['daily_limit_minutes']} m",
+                f"{cfg['min_match_minutes']} m",
+                f"{today_min} m",
+            ))
+        if prev_sel and prev_sel in self.tree.get_children():
+            self.tree.selection_set(prev_sel)
+        self._on_select()
+
+    def _tick(self) -> None:
+        self._refresh_tree()
+        if self.win.winfo_exists():
+            self.win.after(1000, self._tick)
+
+    def _on_select(self, _evt=None) -> None:
+        sel = self.tree.selection()
+        # Don't enable buttons for the placeholder row (which has no iid match).
+        valid = bool(sel) and sel[0] in self.config["applications"]
+        st = "normal" if valid else "disabled"
+        self.edit_btn.configure(state=st)
+        self.remove_btn.configure(state=st)
+
+    def _add_running(self) -> None:
+        AppFormDialog(self.win, "Add from running processes",
+                      from_running=True, on_ok=self._add_app)
+
+    def _add_manual(self) -> None:
+        AppFormDialog(self.win, "Add application manually", on_ok=self._add_app)
+
+    def _edit(self) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            return
+        exe = sel[0]
+        cfg = self.config["applications"].get(exe)
+        if not cfg:
+            return
+        initial = {
+            "display_name": cfg["display_name"],
+            "exe": exe,
+            "daily_limit_minutes": cfg["daily_limit_minutes"],
+            "min_match_minutes": cfg["min_match_minutes"],
+        }
+        AppFormDialog(self.win, "Edit application", initial=initial,
+                      on_ok=lambda upd: self._update_app(exe, upd))
+
+    def _add_app(self, app: dict) -> None:
+        exe = app["exe"]
+        if any(e.lower() == exe.lower() for e in self.config["applications"]):
+            messagebox.showerror(
+                "Already tracked",
+                f"{exe} is already in the list. Use Edit instead.",
+                parent=self.win,
+            )
+            return
+        self.config["applications"][exe] = {
+            "display_name": app["display_name"],
+            "daily_limit_minutes": app["daily_limit_minutes"],
+            "min_match_minutes": app["min_match_minutes"],
+        }
+        save_config(self.config)
+        self.tracker.apply_config_update(self.config)
+        self._refresh_tree()
+
+    def _update_app(self, exe: str, upd: dict) -> None:
+        cfg = self.config["applications"].get(exe)
+        if not cfg:
+            return
+        old_limit = cfg["daily_limit_minutes"]
+        old_match = cfg["min_match_minutes"]
+        loosening = (upd["daily_limit_minutes"] > old_limit
+                     or upd["min_match_minutes"] < old_match)
+        if loosening and not _prompt_passcode(self.win, self.config,
+                                              f"loosen limits for {upd['display_name']}"):
+            return
+        # Display-name-only edits don't need a passcode.
+        cfg["display_name"] = upd["display_name"]
+        cfg["daily_limit_minutes"] = upd["daily_limit_minutes"]
+        cfg["min_match_minutes"] = upd["min_match_minutes"]
+        save_config(self.config)
+        self.tracker.apply_config_update(self.config)
+        self._refresh_tree()
+
+    def _remove(self) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            return
+        exe = sel[0]
+        cfg = self.config["applications"].get(exe)
+        if not cfg:
+            return
+        if not _prompt_passcode(self.win, self.config,
+                                f"stop tracking {cfg['display_name']}"):
+            return
+        if not messagebox.askyesno(
+            "Confirm",
+            f"Stop tracking {cfg['display_name']} ({exe})?\n"
+            f"Today's recorded usage will be discarded.",
+            parent=self.win,
+        ):
+            return
+        del self.config["applications"][exe]
+        save_config(self.config)
+        self.tracker.apply_config_update(self.config)
+        self._refresh_tree()
+
+
+# ---------------------------------------------------------------------------
+# Settings window (with pool-mode radio buttons)
 # ---------------------------------------------------------------------------
 
 class SettingsWindow:
@@ -185,11 +563,17 @@ class SettingsWindow:
         self.config = config
         self.win = tk.Toplevel(root)
         self.win.title("Game Time - Settings")
+        self.win.geometry("560x600")
         self.win.attributes("-topmost", True)
         self.win.protocol("WM_DELETE_WINDOW", self.win.destroy)
 
         self.entries: dict[str, dict[str, tk.Entry]] = {}
-        self.shared_pool_var = tk.StringVar()
+        self.mode_var = tk.StringVar(
+            value="pool" if config.get("shared_pool_minutes") else "per_app"
+        )
+        self.pool_var = tk.StringVar(
+            value=str(config.get("shared_pool_minutes") or 180)
+        )
         self.warning_var = tk.StringVar()
         self.grace_var = tk.StringVar()
         self.daily_var = tk.StringVar()
@@ -197,100 +581,150 @@ class SettingsWindow:
         self.firewall_var = tk.BooleanVar()
 
         self._build()
+        self._on_mode_change()
 
     def _build(self) -> None:
         f = ttk.Frame(self.win, padding=12)
         f.pack(fill="both", expand=True)
 
-        ttk.Label(f, text="Per-game limits", font=("Segoe UI", 10, "bold")).grid(
-            row=0, column=0, columnspan=4, sticky="w", pady=(0, 6)
-        )
-        ttk.Label(f, text="Game").grid(row=1, column=0, sticky="w")
-        ttk.Label(f, text="Daily limit (min)").grid(row=1, column=1, sticky="w", padx=8)
-        ttk.Label(f, text="Min match (min)").grid(row=1, column=2, sticky="w", padx=8)
+        # Mode picker
+        mode_box = ttk.LabelFrame(f, text="Limit mode", padding=8)
+        mode_box.pack(fill="x", pady=(0, 8))
+        ttk.Radiobutton(mode_box, text="Per-application limits",
+                        variable=self.mode_var, value="per_app",
+                        command=self._on_mode_change).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(mode_box, text="Combined pool",
+                        variable=self.mode_var, value="pool",
+                        command=self._on_mode_change).pack(side="left", padx=(0, 12))
+        ttk.Button(mode_box, text="?", width=3, command=self._show_help).pack(side="right")
 
-        row = 2
-        for exe, gcfg in self.config["games"].items():
-            ttk.Label(f, text=gcfg["display_name"]).grid(row=row, column=0, sticky="w", pady=2)
-            limit_e = ttk.Entry(f, width=8)
+        # Pool field (visible only in pool mode)
+        self.pool_frame = ttk.LabelFrame(
+            f, text="Total daily minutes (shared by all apps)", padding=8
+        )
+        ttk.Entry(self.pool_frame, textvariable=self.pool_var, width=10).pack(side="left")
+        ttk.Label(self.pool_frame, text="min").pack(side="left", padx=(4, 0))
+
+        # Per-app grid
+        self.app_frame = ttk.LabelFrame(f, text="Per-application limits", padding=8)
+        ttk.Label(self.app_frame, text="Application").grid(row=0, column=0, sticky="w")
+        self.limit_header = ttk.Label(self.app_frame, text="Daily limit (min)")
+        self.limit_header.grid(row=0, column=1, padx=8)
+        ttk.Label(self.app_frame, text="Min match (min)").grid(row=0, column=2, padx=8)
+
+        row = 1
+        for exe, gcfg in self.config["applications"].items():
+            ttk.Label(self.app_frame, text=gcfg["display_name"]).grid(
+                row=row, column=0, sticky="w", pady=2)
+            limit_e = ttk.Entry(self.app_frame, width=8)
             limit_e.insert(0, str(gcfg["daily_limit_minutes"]))
             limit_e.grid(row=row, column=1, padx=8)
-            match_e = ttk.Entry(f, width=8)
+            match_e = ttk.Entry(self.app_frame, width=8)
             match_e.insert(0, str(gcfg["min_match_minutes"]))
             match_e.grid(row=row, column=2, padx=8)
             self.entries[exe] = {"limit": limit_e, "match": match_e}
             row += 1
+        if not self.config["applications"]:
+            ttk.Label(
+                self.app_frame,
+                text="(no applications yet — add some from Manage Applications…)",
+                foreground="#666",
+            ).grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
+        self.app_frame.pack(fill="x")
 
-        ttk.Separator(f).grid(row=row, column=0, columnspan=4, sticky="ew", pady=8)
-        row += 1
+        ttk.Separator(f).pack(fill="x", pady=8)
 
-        ttk.Label(f, text="Shared pool (min, blank = off)").grid(row=row, column=0, sticky="w")
-        self.shared_pool_var.set("" if not self.config.get("shared_pool_minutes")
-                                 else str(self.config["shared_pool_minutes"]))
-        ttk.Entry(f, width=8, textvariable=self.shared_pool_var).grid(row=row, column=1, padx=8)
-        row += 1
+        misc = ttk.Frame(f)
+        misc.pack(fill="x")
 
-        ttk.Label(f, text="Warning minutes").grid(row=row, column=0, sticky="w")
+        ttk.Label(misc, text="Warning minutes:").grid(row=0, column=0, sticky="w", pady=2)
         self.warning_var.set(str(self.config["warning_minutes"]))
-        ttk.Entry(f, width=8, textvariable=self.warning_var).grid(row=row, column=1, padx=8)
-        row += 1
+        ttk.Entry(misc, textvariable=self.warning_var, width=8).grid(
+            row=0, column=1, padx=8, sticky="w")
 
-        ttk.Label(f, text="Grace after limit (min)").grid(row=row, column=0, sticky="w")
+        ttk.Label(misc, text="Grace after limit (min):").grid(row=1, column=0, sticky="w", pady=2)
         self.grace_var.set(str(self.config.get("grace_minutes", 0)))
-        ttk.Entry(f, width=8, textvariable=self.grace_var).grid(row=row, column=1, padx=8)
-        ttk.Label(f, text="lets the current match finish",
-                  foreground="#666").grid(row=row, column=2, columnspan=2, sticky="w", padx=8)
-        row += 1
+        ttk.Entry(misc, textvariable=self.grace_var, width=8).grid(
+            row=1, column=1, padx=8, sticky="w")
+        ttk.Label(misc, text="(lets the current match finish)",
+                  foreground="#666").grid(row=1, column=2, sticky="w")
 
         self.firewall_var.set(bool(self.config.get("firewall_block_at_warning", True)))
         ttk.Checkbutton(
-            f, text="Block game's internet during warning window (admin only)",
+            misc, text="Block app's internet during warning window (admin only)",
             variable=self.firewall_var,
-        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 4))
-        row += 1
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=2)
 
-        ttk.Label(f, text="Daily summary (HH:MM)").grid(row=row, column=0, sticky="w")
+        ttk.Label(misc, text="Daily summary (HH:MM):").grid(row=3, column=0, sticky="w", pady=2)
         self.daily_var.set(self.config["daily_summary_time"])
-        ttk.Entry(f, width=8, textvariable=self.daily_var).grid(row=row, column=1, padx=8)
-        row += 1
+        ttk.Entry(misc, textvariable=self.daily_var, width=8).grid(
+            row=3, column=1, padx=8, sticky="w")
 
-        ttk.Label(f, text="Weekly summary (HH:MM, Mon)").grid(row=row, column=0, sticky="w")
+        ttk.Label(misc, text="Weekly summary (Mon HH:MM):").grid(row=4, column=0, sticky="w", pady=2)
         self.weekly_var.set(self.config["weekly_summary_time"])
-        ttk.Entry(f, width=8, textvariable=self.weekly_var).grid(row=row, column=1, padx=8)
-        row += 1
+        ttk.Entry(misc, textvariable=self.weekly_var, width=8).grid(
+            row=4, column=1, padx=8, sticky="w")
 
-        ttk.Separator(f).grid(row=row, column=0, columnspan=4, sticky="ew", pady=8)
-        row += 1
+        ttk.Separator(f).pack(fill="x", pady=8)
+        pc = ttk.Frame(f)
+        pc.pack(fill="x")
         passcode_state = "set" if passcode_is_set(self.config) else "not set"
-        ttk.Label(f, text=f"Passcode: {passcode_state}").grid(row=row, column=0, sticky="w")
+        ttk.Label(pc, text=f"Passcode: {passcode_state}").pack(side="left")
         ttk.Button(
-            f, text="Set / change…",
+            pc, text="Set / change…",
             command=lambda: _set_passcode_dialog(self.win, self.config),
-        ).grid(row=row, column=1, padx=8, sticky="w")
-        row += 1
+        ).pack(side="left", padx=8)
 
         btns = ttk.Frame(f)
-        btns.grid(row=row, column=0, columnspan=4, sticky="e", pady=(12, 0))
+        btns.pack(fill="x", pady=(12, 0))
         ttk.Button(btns, text="Cancel", command=self.win.destroy).pack(side="right", padx=4)
         ttk.Button(btns, text="Save", command=self._save).pack(side="right", padx=4)
 
+    def _on_mode_change(self) -> None:
+        if self.mode_var.get() == "pool":
+            self.pool_frame.pack(fill="x", pady=(0, 8), before=self.app_frame)
+            self.limit_header.configure(text="Per-app cap (ignored in pool mode)")
+            for fields in self.entries.values():
+                fields["limit"].configure(state="disabled")
+        else:
+            self.pool_frame.pack_forget()
+            self.limit_header.configure(text="Daily limit (min)")
+            for fields in self.entries.values():
+                fields["limit"].configure(state="normal")
+
+    def _show_help(self) -> None:
+        messagebox.showinfo(
+            "Limit modes",
+            "Per-application limits:\n"
+            "    Each app has its own daily allowance.\n\n"
+            "Combined pool:\n"
+            "    All apps share one daily allowance. Per-app limits\n"
+            "    are ignored while pool mode is on; switching back\n"
+            "    restores them.",
+            parent=self.win,
+        )
+
     def _save(self) -> None:
         try:
-            new_games: dict[str, dict] = {}
+            new_apps: dict[str, dict] = {}
             loosening = False
+            mode = self.mode_var.get()
 
             for exe, fields in self.entries.items():
-                limit = int(fields["limit"].get())
+                old_cfg = self.config["applications"][exe]
+                # In pool mode, the limit field is disabled - keep the old value.
+                if mode == "pool":
+                    limit = old_cfg["daily_limit_minutes"]
+                else:
+                    limit = int(fields["limit"].get())
                 match = int(fields["match"].get())
                 if limit <= 0 or match < 0 or match > limit:
                     raise ValueError(f"Invalid limits for {exe}.")
-                old_limit = self.config["games"][exe]["daily_limit_minutes"]
-                old_match = self.config["games"][exe]["min_match_minutes"]
-                if limit > old_limit or match < old_match:
+                if limit > old_cfg["daily_limit_minutes"] or match < old_cfg["min_match_minutes"]:
                     loosening = True
-                new_games[exe] = dict(self.config["games"][exe])
-                new_games[exe]["daily_limit_minutes"] = limit
-                new_games[exe]["min_match_minutes"] = match
+                new_apps[exe] = dict(old_cfg)
+                new_apps[exe]["daily_limit_minutes"] = limit
+                new_apps[exe]["min_match_minutes"] = match
 
             warning = int(self.warning_var.get())
             if warning < 0:
@@ -311,12 +745,18 @@ class SettingsWindow:
                 if not (0 <= int(hh) < 24 and 0 <= int(mm) < 60):
                     raise ValueError(f"Invalid time '{v}'.")
 
-            sp_raw = self.shared_pool_var.get().strip()
-            new_pool = int(sp_raw) if sp_raw else None
             old_pool = self.config.get("shared_pool_minutes")
-            if (old_pool is not None and new_pool is None) or \
-               (old_pool is not None and new_pool is not None and new_pool > old_pool):
-                loosening = True
+            if mode == "pool":
+                new_pool = int(self.pool_var.get())
+                if new_pool <= 0:
+                    raise ValueError("Combined pool minutes must be > 0.")
+                if old_pool is not None and new_pool > old_pool:
+                    loosening = True
+            else:
+                new_pool = None
+                if old_pool is not None:
+                    # Switching pool off is loosening (per-app caps may now be larger).
+                    loosening = True
 
             new_firewall = bool(self.firewall_var.get())
             if self.config.get("firewall_block_at_warning", True) and not new_firewall:
@@ -330,8 +770,7 @@ class SettingsWindow:
                                               "save these settings (loosens limits)"):
             return
 
-        # All clear - apply.
-        self.config["games"] = new_games
+        self.config["applications"] = new_apps
         self.config["warning_minutes"] = warning
         self.config["grace_minutes"] = grace
         self.config["daily_summary_time"] = self.daily_var.get().strip()
@@ -365,10 +804,9 @@ class UsageEditor:
         self.win.protocol("WM_DELETE_WINDOW", self.win.destroy)
 
         self.entries: dict[str, tk.Entry] = {}
-        # Snapshot current usage for "loosening" comparison
         self._original_seconds: dict[str, int] = {
             exe: info["played_seconds"]
-            for exe, info in self.tracker.get_status()["games"].items()
+            for exe, info in self.tracker.get_status()["applications"].items()
         }
         self._build()
 
@@ -383,7 +821,7 @@ class UsageEditor:
 
         status = self.tracker.get_status()
         row = 2
-        for exe, info in status["games"].items():
+        for exe, info in status["applications"].items():
             ttk.Label(f, text=info["display_name"]).grid(row=row, column=0, sticky="w", pady=2)
             played_min = info["played_seconds"] // 60
             e = ttk.Entry(f, width=8)
@@ -392,6 +830,10 @@ class UsageEditor:
             ttk.Button(f, text="Reset to 0",
                        command=lambda x=exe: self._set_one(x, 0)).grid(row=row, column=2)
             self.entries[exe] = e
+            row += 1
+        if not status["applications"]:
+            ttk.Label(f, text="(no applications tracked)",
+                      foreground="#666").grid(row=row, column=0, columnspan=3, sticky="w")
             row += 1
 
         btns = ttk.Frame(f)
@@ -411,7 +853,6 @@ class UsageEditor:
         self.entries[exe].insert(0, str(minutes))
 
     def _reset_all(self) -> None:
-        # Single passcode prompt for the whole batch.
         if any(0 < self._original_seconds.get(exe, 0) for exe in self.entries):
             if not _prompt_passcode(self.win, self.config,
                                     "reset usage (gives back time)"):
@@ -453,7 +894,7 @@ class UsageEditor:
 
 def run_ui(tracker, config: dict) -> None:
     root = tk.Tk()
-    root.withdraw()  # Never show the root; only Toplevel windows are visible.
+    root.withdraw()
 
     open_windows: dict[str, object] = {}
 
@@ -469,7 +910,6 @@ def run_ui(tracker, config: dict) -> None:
                 pass
         win = factory()
         open_windows[name] = win
-        # Drop reference when the window is destroyed.
         win.win.bind("<Destroy>", lambda _e, n=name: open_windows.pop(n, None))
 
     def show_status() -> None:
@@ -477,6 +917,9 @@ def run_ui(tracker, config: dict) -> None:
 
     def show_settings() -> None:
         _open("settings", lambda: SettingsWindow(root, tracker, config))
+
+    def show_manage_apps() -> None:
+        _open("manage", lambda: ManageApplicationsWindow(root, tracker, config))
 
     def show_usage_editor() -> None:
         _open("usage", lambda: UsageEditor(root, tracker, config))
@@ -512,11 +955,14 @@ def run_ui(tracker, config: dict) -> None:
             pass
         os._exit(0)
 
-    # ---- Tray icon ----
     icon_image = _make_icon_image()
     menu = pystray.Menu(
-        pystray.MenuItem("Show today's usage", lambda: root.after(0, show_status), default=True),
-        pystray.MenuItem("Edit today's usage…", lambda: root.after(0, show_usage_editor)),
+        pystray.MenuItem("Show today's usage",
+                         lambda: root.after(0, show_status), default=True),
+        pystray.MenuItem("Edit today's usage…",
+                         lambda: root.after(0, show_usage_editor)),
+        pystray.MenuItem("Manage applications…",
+                         lambda: root.after(0, show_manage_apps)),
         pystray.MenuItem("Settings…", lambda: root.after(0, show_settings)),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Open log", lambda: root.after(0, open_log)),
@@ -526,17 +972,16 @@ def run_ui(tracker, config: dict) -> None:
     icon = pystray.Icon("GameTimeLimiter", icon_image, "Game Time Limiter", menu)
     icon.run_detached()
 
-    # ---- Tooltip refresher ----
     def refresh_tooltip() -> None:
         try:
             status = tracker.get_status()
             parts = []
-            for info in status["games"].values():
+            for info in status["applications"].values():
                 parts.append(f"{info['display_name']}: {_fmt(info['remaining_seconds'])} left")
             if status.get("shared_pool_minutes"):
                 pool_left = status["shared_pool_minutes"] * 60 - status["shared_pool_used_seconds"]
                 parts.append(f"Pool: {_fmt(max(0, pool_left))} left")
-            icon.title = "Game Time Limiter\n" + "\n".join(parts)
+            icon.title = "Game Time Limiter\n" + "\n".join(parts) if parts else "Game Time Limiter"
         except Exception:
             logging.exception("Tray tooltip refresh failed.")
         root.after(TRAY_REFRESH_MS, refresh_tooltip)
