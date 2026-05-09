@@ -49,6 +49,11 @@ class GameTracker:
         # In-memory only: which applications are currently running and have a live session.
         self.app_running: dict[str, bool] = {exe: False for exe in self.applications}
 
+        # In-memory only: exe names whose firewall block we've attempted this session.
+        # Prevents retrying netsh every 5s when block_outbound fails (e.g. no admin),
+        # which would otherwise trigger a UAC secure-desktop dim every poll.
+        self._firewall_block_attempted: set[str] = set()
+
         # Wall-clock time of previous poll (for midnight-split delta).
         self._last_poll_dt: datetime | None = None
 
@@ -68,6 +73,9 @@ class GameTracker:
             unblock_all(previously_blocked)
             reset_day_flags(self.state)
             save_state(self.state)
+            # Allow firewall block attempts again for the new day.
+            if hasattr(self, "_firewall_block_attempted"):
+                self._firewall_block_attempted.clear()
             # Refresh data from disk in case another process touched it.
             self.data = load_data()
 
@@ -120,10 +128,16 @@ class GameTracker:
         return None
 
     def _apply_firewall_block(self, exe_name: str) -> bool:
-        """Apply firewall block if not already blocked. Returns True if a new block was applied."""
+        """Apply firewall block if not already blocked or already attempted this session.
+        Returns True if a new block was applied. Failed attempts are remembered
+        in-memory so we don't spam netsh (and trigger UAC prompts) every poll.
+        """
         blocked_map = self.state.setdefault("firewall_blocked", {})
         if blocked_map.get(exe_name):
             return False
+        if exe_name in self._firewall_block_attempted:
+            return False
+        self._firewall_block_attempted.add(exe_name)
         path = self._capture_exe_path(exe_name)
         if not path:
             logging.warning("Cannot block %s: exe path unknown.", exe_name)
@@ -132,6 +146,7 @@ class GameTracker:
             blocked_map[exe_name] = True
             save_state(self.state)
             return True
+        logging.warning("Firewall block failed for %s; will not retry until restart.", exe_name)
         return False
 
     # ------------------------------------------------------------------
@@ -274,23 +289,21 @@ class GameTracker:
 
                 if remaining <= 0:
                     # Limit hit. First time? Notify and (if grace=0) kill now.
+                    # Set the flag regardless of toast success so we don't retry
+                    # every 5s if the toast subsystem is unavailable.
                     if not kill_notified.get(exe):
                         if self.grace_minutes > 0:
-                            if notify_warning(
+                            notify_warning(
                                 cfg["display_name"] + " (limit reached)",
                                 self.grace_minutes,
-                            ):
-                                kill_notified[exe] = True
-                                any_state_change = True
-                                logging.info("%s grace started (%dm).", exe, self.grace_minutes)
+                            )
+                            logging.info("%s grace started (%dm).", exe, self.grace_minutes)
                         elif pool_remaining is not None and pool_remaining <= 0:
-                            if notify_shared_pool_killed(cfg["display_name"]):
-                                kill_notified[exe] = True
-                                any_state_change = True
+                            notify_shared_pool_killed(cfg["display_name"])
                         else:
-                            if notify_killed_time_up(cfg["display_name"]):
-                                kill_notified[exe] = True
-                                any_state_change = True
+                            notify_killed_time_up(cfg["display_name"])
+                        kill_notified[exe] = True
+                        any_state_change = True
 
                     # Always block the firewall once the limit is hit.
                     if self._apply_firewall_block(exe):
@@ -307,10 +320,10 @@ class GameTracker:
 
                 elif remaining <= warning_s and not warned.get(exe):
                     mins_left = max(1, remaining // 60)
-                    if notify_warning(cfg["display_name"], mins_left):
-                        warned[exe] = True
-                        any_state_change = True
-                        logging.info("Warning sent for %s: %dm remaining.", exe, mins_left)
+                    notify_warning(cfg["display_name"], mins_left)
+                    warned[exe] = True
+                    any_state_change = True
+                    logging.info("Warning sent for %s: %dm remaining.", exe, mins_left)
                     if self.firewall_block_at_warning:
                         if self._apply_firewall_block(exe):
                             any_state_change = True
@@ -445,6 +458,8 @@ class GameTracker:
             if seconds < limit_s and self.state.get("firewall_blocked", {}).get(exe):
                 unblock_outbound(exe)
                 self.state["firewall_blocked"].pop(exe, None)
+            # Clearing usage means the next limit-hit can attempt the block again.
+            self._firewall_block_attempted.discard(exe)
             save_data(self.data)
             save_state(self.state)
             logging.info("Usage override: %s set to %ds.", exe, seconds)
