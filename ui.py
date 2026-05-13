@@ -141,29 +141,41 @@ class StatusWindow:
         self.win.attributes("-topmost", True)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.rows: dict[str, dict] = {}
-        self._built_for: set[str] = set()
-        self._build()
+        self._mode: str | None = None  # "pool" or "per_app"; rebuilt on change
+        self._build_shell()
         self._refresh()
 
-    def _build(self) -> None:
-        self.outer = ttk.Frame(self.win, padding=12)
-        self.outer.pack(fill="both", expand=True)
+    def _build_shell(self) -> None:
+        outer = ttk.Frame(self.win, padding=12)
+        outer.pack(fill="both", expand=True)
+        self.title_label = ttk.Label(outer, text="Today's playtime",
+                                     font=("Segoe UI", 11, "bold"))
+        self.title_label.pack(anchor="w")
+        ttk.Separator(outer).pack(fill="x", pady=(4, 8))
+        self.body = ttk.Frame(outer)
+        self.body.pack(fill="both", expand=True)
+        self.subnote = ttk.Label(outer, text="", anchor="w", foreground="#666")
+        self.subnote.pack(fill="x", pady=(8, 0))
 
-        ttk.Label(self.outer, text="Today's playtime",
-                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Separator(self.outer).pack(fill="x", pady=(4, 8))
-
-        self.rows_frame = ttk.Frame(self.outer)
-        self.rows_frame.pack(fill="both", expand=True)
-
-        self.pool_label = ttk.Label(self.outer, text="", anchor="w")
-        self.pool_label.pack(fill="x", pady=(8, 0))
+    def _rebuild_for_mode(self, mode: str) -> None:
+        for child in self.body.winfo_children():
+            child.destroy()
+        self._mode = mode
+        if mode == "pool":
+            self.pool_bar = ttk.Progressbar(self.body, length=320, maximum=1)
+            self.pool_bar.pack(fill="x", pady=4)
+            self.pool_label = ttk.Label(self.body, text="", anchor="w")
+            self.pool_label.pack(fill="x", pady=(2, 6))
+            self.per_app_label = ttk.Label(self.body, text="", anchor="w",
+                                           foreground="#666", justify="left")
+            self.per_app_label.pack(fill="x", pady=(4, 0))
+        else:
+            self.rows: dict[str, dict] = {}
 
     def _ensure_row(self, exe: str, display_name: str) -> None:
-        if exe in self._built_for:
+        if exe in self.rows:
             return
-        row = ttk.Frame(self.rows_frame)
+        row = ttk.Frame(self.body)
         row.pack(fill="x", pady=4)
         name = ttk.Label(row, text=display_name, width=22, anchor="w")
         name.pack(side="left")
@@ -172,40 +184,51 @@ class StatusWindow:
         label = ttk.Label(row, text="", width=18, anchor="w")
         label.pack(side="left")
         self.rows[exe] = {"row": row, "name": name, "bar": bar, "label": label}
-        self._built_for.add(exe)
 
     def _refresh(self) -> None:
         if not self.win.winfo_exists():
             return
         status = self.tracker.get_status()
-        live_exes = set(status["applications"].keys())
-
-        # Drop UI rows for apps that were removed.
-        for exe in list(self.rows.keys()):
-            if exe not in live_exes:
-                self.rows[exe]["row"].destroy()
-                self.rows.pop(exe, None)
-                self._built_for.discard(exe)
-
-        for exe, info in status["applications"].items():
-            self._ensure_row(exe, info["display_name"])
-            r = self.rows[exe]
-            r["name"].configure(text=info["display_name"])
-            r["bar"]["maximum"] = max(1, info["limit_seconds"])
-            r["bar"]["value"] = min(info["played_seconds"], info["limit_seconds"])
-            tag = "  [running]" if info["running"] else ""
-            r["label"].configure(
-                text=f"{_fmt(info['played_seconds'])} / {_fmt(info['limit_seconds'])}{tag}"
-            )
-
         pool = status.get("shared_pool_minutes")
-        if pool:
+        mode = "pool" if pool else "per_app"
+
+        if mode != self._mode:
+            self._rebuild_for_mode(mode)
+
+        if mode == "pool":
+            pool_s = pool * 60
             used = status["shared_pool_used_seconds"]
+            self.pool_bar["maximum"] = max(1, pool_s)
+            self.pool_bar["value"] = min(used, pool_s)
             self.pool_label.configure(
-                text=f"Combined pool: {_fmt(used)} / {_fmt(pool * 60)}"
+                text=f"Combined pool: {_fmt(used)} / {_fmt(pool_s)}"
             )
+            running_lines = []
+            for info in status["applications"].values():
+                tag = " [running]" if info["running"] else ""
+                running_lines.append(
+                    f"  • {info['display_name']}: {_fmt(info['played_seconds'])}{tag}"
+                )
+            self.per_app_label.configure(text="\n".join(running_lines))
+            self.subnote.configure(text="Per-app caps are ignored while combined pool is on.")
         else:
-            self.pool_label.configure(text="Combined pool: off")
+            live_exes = set(status["applications"].keys())
+            for exe in list(self.rows.keys()):
+                if exe not in live_exes:
+                    self.rows[exe]["row"].destroy()
+                    self.rows.pop(exe, None)
+            for exe, info in status["applications"].items():
+                self._ensure_row(exe, info["display_name"])
+                r = self.rows[exe]
+                r["name"].configure(text=info["display_name"])
+                r["bar"]["maximum"] = max(1, info["limit_seconds"])
+                r["bar"]["value"] = min(info["played_seconds"], info["limit_seconds"])
+                tag = "  [running]" if info["running"] else ""
+                r["label"].configure(
+                    text=f"{_fmt(info['played_seconds'])} / {_fmt(info['limit_seconds'])}{tag}"
+                )
+            self.subnote.configure(text="Combined pool: off")
+
         self.win.after(REFRESH_MS, self._refresh)
 
     def close(self) -> None:

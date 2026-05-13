@@ -22,7 +22,7 @@ from notifications import (
     notify_shared_pool_killed,
     notify_warning,
 )
-from firewall import block_outbound, unblock_outbound, unblock_all
+from firewall import block_outbound, unblock_outbound, unblock_all, is_admin
 
 
 class GameTracker:
@@ -41,6 +41,12 @@ class GameTracker:
         self.shared_pool_minutes: int | None = config.get("shared_pool_minutes") or None
         self.grace_minutes: int = int(config.get("grace_minutes", 0) or 0)
         self.firewall_block_at_warning: bool = bool(config.get("firewall_block_at_warning", True))
+        if self.firewall_block_at_warning and not is_admin():
+            logging.warning(
+                "firewall_block_at_warning is on but the tracker is not running as admin; "
+                "the firewall feature will be skipped. Re-run via the Task Scheduler entry "
+                "(setup_startup.py registers it at HIGHEST privilege) or disable the option in Settings."
+            )
 
         self.data: dict = load_data()
         self.state: dict = load_state()
